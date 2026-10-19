@@ -1,0 +1,50 @@
+# Standard 集群版 Standby 容量缓冲(集群 ≥1.36 后可用;与 Autopilot 版差异仅节点定位方式)
+# 注意:缓冲假 pod 的形状必须与真实沙箱负载一致(gVisor 选择器+污点容忍),否则备的地调度器不用
+apiVersion: v1
+kind: PodTemplate
+metadata:
+  name: sandbox-buffer-pod-template
+  namespace: default
+template:
+  metadata:
+    labels: { app: sandbox-buffer-shape }
+  spec:
+    runtimeClassName: gvisor
+    nodeSelector:
+      sandbox.gke.io/runtime: gvisor
+    tolerations:
+      - key: sandbox.gke.io/runtime
+        operator: Equal
+        value: gvisor
+        effect: NoSchedule
+    containers:
+      - name: shape
+        image: registry.k8s.io/pause:3.9
+        resources:
+          requests: { cpu: "500m", memory: "2Gi" }
+---
+apiVersion: autoscaling.x-k8s.io/v1beta1
+kind: CapacityBuffer
+metadata:
+  name: sandbox-standby-buffer
+  namespace: default
+  annotations:
+    buffer.gke.io/standby-capacity-init-time: "6m"
+    buffer.gke.io/standby-capacity-refresh-frequency: "24h"
+spec:
+  podTemplateRef:
+    name: sandbox-buffer-pod-template
+  replicas: 4
+  provisioningStrategy: "buffer.gke.io/standby-capacity"
+---
+# Active 缓冲(运行中空位保底;与 Autopilot 侧语义一致,L2 层可调的实体)
+apiVersion: autoscaling.x-k8s.io/v1beta1
+kind: CapacityBuffer
+metadata:
+  name: sandbox-active-buffer
+  namespace: default
+spec:
+  podTemplateRef:
+    name: sandbox-buffer-pod-template
+  replicas: 2
+  provisioningStrategy: "buffer.x-k8s.io/active-capacity"

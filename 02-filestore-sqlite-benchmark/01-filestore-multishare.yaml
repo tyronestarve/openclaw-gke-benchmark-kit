@@ -1,0 +1,17 @@
+# Filestore Enterprise multishare 工作盘:
+# - 内置 enterprise-multishare-rwx 假定 VPC 名为 default,自定义网络必须显式给 network 参数
+# - 首张 PVC 触发创建 1TiB Enterprise 实例(15~30 分钟);后续 share 从实例上秒级切分
+# - 实例最小 1TiB(约 $600+/月),测试完请删除全部 PVC 让实例回收
+apiVersion: storage.k8s.io/v1
+kind: StorageClass
+metadata:
+  name: openclaw-fsms
+provisioner: filestore.csi.storage.gke.io
+parameters:
+  tier: enterprise
+  multishare: "true"
+  network: "sandbox-network"        # 集群所在 VPC
+  instance-storageclass-label: openclaw-fsms
+  max-volume-size: "128Gi"   # 单 share 上限压到 128Gi → 单实例可切 80 个 share(默认仅 10 个,超了会裂新实例)
+volumeBindingMode: WaitForFirstConsumer
+allowVolumeExpansion: true

@@ -1,0 +1,83 @@
+# PoC 应答方案验证用清单（v0.5.2 / v1beta1 实测版）
+# 模板含 Item 8 改造：配置从 ConfigMap 底座复制到可写路径，网关监听可写副本
+apiVersion: extensions.agents.x-k8s.io/v1beta1
+kind: SandboxTemplate
+metadata:
+  name: openclaw-template
+  namespace: default
+spec:
+  service: true
+  podTemplate:
+    metadata:
+      labels:
+        sandbox: openclaw-poc
+    spec:
+      runtimeClassName: gvisor
+      automountServiceAccountToken: false
+      securityContext:
+        runAsUser: 1000
+        runAsGroup: 1000
+        fsGroup: 1000
+      containers:
+        - name: openclaw
+          # 交付客户前替换为客户镜像地址（${OPENCLAW_IMAGE}）；当前为内部验证环境值
+          image: us-central1-docker.pkg.dev/${PROJECT_ID}/ghcr/openclaw/openclaw:2026.3.23
+          imagePullPolicy: IfNotPresent
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: false
+            runAsNonRoot: true
+            capabilities:
+              drop: ["ALL"]
+          env:
+            - name: OPENCLAW_GATEWAY_TOKEN
+              value: "dummy-token-for-sandbox"
+            # Item 8 改造：指向可写副本（原为只读的 ConfigMap subPath 挂载点）
+            - name: OPENCLAW_CONFIG_PATH
+              value: "/home/node/.openclaw/openclaw.json"
+          command: ["sh", "-c"]
+          args:
+            - |
+              [ -f /home/node/.openclaw/openclaw.json ] || cp /etc/openclaw/openclaw.json /home/node/.openclaw/openclaw.json && \
+              exec node dist/index.js gateway --bind=lan --port 18789 --allow-unconfigured --verbose
+          ports:
+            - containerPort: 18789
+            - containerPort: 18790
+          volumeMounts:
+            - mountPath: /home/node/.openclaw/workspace
+              name: workspaces-pvc
+            - mountPath: /home/node/.openclaw
+              name: config-volume
+            - mountPath: /etc/openclaw/openclaw.json
+              name: cm-volume
+              subPath: openclaw.json
+          resources:
+            requests: { cpu: "500m", memory: "2Gi" }
+            limits: { cpu: "2", memory: "4Gi" }
+      volumes:
+        - name: config-volume
+          emptyDir: {}
+        - name: cm-volume
+          configMap:
+            name: openclaw-config
+        - name: workspaces-pvc
+          ephemeral:
+            volumeClaimTemplate:
+              spec:
+                # Filestore multishare(与 Autopilot 栈一致;share 预切靠热池摊平,勿在风暴中现切)
+                # Standard 集群的终态方向是共享大卷+子目录 late-bind(见 latebind/),此为对齐 Autopilot 能力的过渡态
+                accessModes: ["ReadWriteMany"]
+                storageClassName: "openclaw-fsms"
+                resources:
+                  requests:
+                    storage: 10Gi
+---
+apiVersion: extensions.agents.x-k8s.io/v1beta1
+kind: SandboxWarmPool
+metadata:
+  name: openclaw-pool
+  namespace: default
+spec:
+  replicas: 2
+  sandboxTemplateRef:
+    name: openclaw-template

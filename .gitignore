@@ -1,0 +1,7 @@
+# 本地会话/工具配置
+.claude/
+# Terraform 本地产物
+**/.terraform/
+*.tfstate
+*.tfstate.*
+*.bak

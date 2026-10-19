@@ -1,0 +1,92 @@
+# sandbox-router(Go 版)+ 公网 Gateway —— 按主机名路由到各工号沙箱
+# 访问形态: http://emp-<工号>.<GW_IP>.nip.io/  → router(X-Sandbox-ID 头由每工号的 HTTPRoute 注入)
+# 每工号的 HTTPRoute 由 portal 在领取/删除时自动创建/回收。
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: sandbox-router
+  namespace: default
+  labels: { app.kubernetes.io/name: sandbox-router }
+spec:
+  replicas: 1                      # PoC 单副本;生产 ≥2
+  selector:
+    matchLabels: { app.kubernetes.io/name: sandbox-router }
+  template:
+    metadata:
+      labels: { app.kubernetes.io/name: sandbox-router }
+    spec:
+      containers:
+        - name: sandbox-router
+          image: registry.k8s.io/agent-sandbox/sandbox-router-go:v1.0.2
+          args:
+            - --http-bind-address=:8080
+            - --health-probe-bind-address=:8081
+            - --cluster-domain=cluster.local
+            - --proxy-timeout=180s
+            - --upstream-max-retries=3
+            - --cache-enabled=false     # 按工号 Service 名走 DNS 寻址,无需 informer cache/RBAC
+          ports:
+            - { name: proxy, containerPort: 8080 }
+            - { name: healthz, containerPort: 8081 }
+          readinessProbe:
+            httpGet: { path: /readyz, port: healthz }
+          livenessProbe:
+            httpGet: { path: /healthz, port: healthz }
+          resources:
+            requests: { cpu: 50m, memory: 128Mi }   # PoC 小节点;生产按压测调
+            limits: { cpu: "1", memory: 512Mi }
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            runAsNonRoot: true
+            runAsUser: 65532
+            capabilities: { drop: ["ALL"] }
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: sandbox-router-svc
+  namespace: default
+  labels: { app.kubernetes.io/name: sandbox-router }
+spec:
+  type: ClusterIP
+  selector: { app.kubernetes.io/name: sandbox-router }
+  ports:
+    - { name: proxy, port: 8080, targetPort: proxy }
+---
+# LB 健康检查必须打 router 的探活端口(默认打 8080/ 会因缺路由头报错 → 503)
+apiVersion: networking.gke.io/v1
+kind: HealthCheckPolicy
+metadata:
+  name: sandbox-router-hc
+  namespace: default
+spec:
+  default:
+    config:
+      type: HTTP
+      httpHealthCheck: { port: 8081, requestPath: /readyz }
+  targetRef: { group: "", kind: Service, name: sandbox-router-svc }
+---
+# WebSocket 长连接:后端超时提到 1 小时
+apiVersion: networking.gke.io/v1
+kind: GCPBackendPolicy
+metadata:
+  name: sandbox-router-backend-policy
+  namespace: default
+spec:
+  default: { timeoutSec: 3600 }
+  targetRef: { group: "", kind: Service, name: sandbox-router-svc }
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: Gateway
+metadata:
+  name: openclaw-external
+  namespace: default
+spec:
+  gatewayClassName: gke-l7-global-external-managed
+  listeners:
+    - name: http
+      protocol: HTTP
+      port: 80
+      allowedRoutes:
+        namespaces: { from: Same }

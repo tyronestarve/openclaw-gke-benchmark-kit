@@ -1,0 +1,33 @@
+# 实验:Standby 容量缓冲 × gVisor+ComputeClass 在 Autopilot 上是否成立
+# (R6 在 Standard 上判死刑的 L3 省钱层,Autopilot 的 NAP 已实证能供 Sandbox 节点,验证翻案)
+apiVersion: v1
+kind: PodTemplate
+metadata:
+  name: sandbox-buffer-pod-template
+  namespace: default
+template:
+  metadata:
+    labels: { app: sandbox-buffer-shape }
+  spec:
+    runtimeClassName: gvisor
+    nodeSelector:
+      cloud.google.com/compute-class: sandbox-snap
+    containers:
+      - name: shape
+        image: registry.k8s.io/pause:3.9
+        resources:
+          requests: { cpu: "500m", memory: "2Gi" }
+---
+apiVersion: autoscaling.x-k8s.io/v1beta1
+kind: CapacityBuffer
+metadata:
+  name: sandbox-standby-buffer
+  namespace: default
+  annotations:
+    buffer.gke.io/standby-capacity-init-time: "6m"        # 建成后保持运行 6 分钟再挂起
+    buffer.gke.io/standby-capacity-refresh-frequency: "24h"
+spec:
+  podTemplateRef:
+    name: sandbox-buffer-pod-template
+  replicas: 4                                             # ≈1 台 n2-standard-4 的沙箱容量
+  provisioningStrategy: "buffer.gke.io/standby-capacity"

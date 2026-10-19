@@ -1,0 +1,215 @@
+# ==============================================================================
+# 17-latebind-agent-volumes.yaml
+# 基于 Filestore Agent Volumes (volume-pool-sc) 的动态存储晚绑定 (Late-bind) 清单
+#
+# 官方文档参考:
+#   https://docs.cloud.google.com/filestore/docs/agent-sandbox-latebind
+#
+# 核心设计:
+#   1. SandboxWarmPool 预先启动不带持久卷的 gVisor 待命沙箱（挂载 emptyDir 并配置
+#      dev.gvisor.empty-dir.workspace-volume.force-shared: "true"）。
+#   2. 每位用户拥有独立的 Filestore Agent Volume PVC（亚秒级创建，单卷独立容量配额）。
+#   3. 认领沙箱瞬间，节点守护进程 (storage-node-daemon) 执行 action=bind_nfs，
+#      将用户专属 Agent Volume 的 NFS 导出直接挂载进运行中沙箱的 emptyDir (< 100ms)。
+#   4. 要求：GKE Standard 集群（版本 >= 1.36.0-gke.3302001）。
+# ==============================================================================
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: storage-node-daemon
+  namespace: default
+spec:
+  selector:
+    matchLabels:
+      app: storage-node-daemon
+  template:
+    metadata:
+      labels:
+        app: storage-node-daemon
+    spec:
+      hostPID: true
+      nodeSelector:
+        sandbox.gke.io/runtime: gvisor
+      tolerations:
+        - key: "sandbox.gke.io/runtime"
+          operator: "Equal"
+          value: "gvisor"
+          effect: "NoSchedule"
+      initContainers:
+        - name: install-nfs
+          image: debian:stable-slim
+          securityContext:
+            privileged: true
+          volumeMounts:
+            - name: host-root
+              mountPath: /host-root
+              mountPropagation: Bidirectional
+          command: ["/bin/sh", "-c"]
+          args:
+            - |
+              nsenter -t 1 -m -u -i -n -- which mount.nfs >/dev/null 2>&1 || \
+              (nsenter -t 1 -m -u -i -n -- apt-get update && \
+               nsenter -t 1 -m -u -i -n -- apt-get install -y nfs-common) || true
+      containers:
+        - name: daemon
+          image: python:3.11-slim
+          securityContext:
+            privileged: true
+          volumeMounts:
+            - name: host-root
+              mountPath: /host-root
+              mountPropagation: Bidirectional
+          command: ["python3", "-u", "-c"]
+          args:
+            - |
+              import os, json, subprocess, traceback
+              from http.server import BaseHTTPRequestHandler, HTTPServer
+
+              def safe_join(base, *parts):
+                  base = os.path.abspath(base)
+                  path = os.path.abspath(os.path.join(base, *parts))
+                  if os.path.commonpath([base, path]) != base:
+                      raise ValueError("Path escapes base directory")
+                  return path
+
+              class Handler(BaseHTTPRequestHandler):
+                  def do_POST(self):
+                      try:
+                          length = int(self.headers.get('Content-Length', 0))
+                          data = json.loads(self.rfile.read(length))
+                          pod_uid = data['pod_uid']
+                          action = data['action']
+                          volume_name = data['volume_name']
+                          sub_dir = data['sub_dir']
+
+                          parent = safe_join("/host-root/var/lib/kubelet/pods",
+                                             pod_uid, "volumes/kubernetes.io~empty-dir", volume_name)
+                          target = safe_join(parent, sub_dir)
+                          host_target = safe_join("/var/lib/kubelet/pods", pod_uid,
+                                                  "volumes/kubernetes.io~empty-dir", volume_name, sub_dir)
+
+                          if action == "bind_nfs":
+                              source = f"{data['nfs_server']}:{data['nfs_path']}"
+                              os.makedirs(target, exist_ok=True)
+                              mount_opts = "vers=3,proto=tcp,mountproto=tcp,port=2049,mountport=2050,nolock"
+                              if data.get("is_readonly"):
+                                  mount_opts += ",ro"
+                              subprocess.run(["nsenter", "-t", "1", "-m", "--",
+                                              "mount", "-t", "nfs", "-o", mount_opts, source, host_target], check=True)
+                              if not data.get("is_readonly"):
+                                  subprocess.run(["nsenter", "-t", "1", "-m", "--",
+                                                  "chown", "-R", "1000:1000", host_target], check=True)
+                              with open(f"{parent}/.ready", "w") as f:
+                                  f.write("ready")
+                              msg = f"Bound {source} to {host_target}"
+                          elif action == "unbind":
+                              subprocess.run(["nsenter", "-t", "1", "-m", "--",
+                                              "umount", "-l", host_target], check=True)
+                              ready_file = f"{parent}/.ready"
+                              if os.path.exists(ready_file):
+                                  os.remove(ready_file)
+                              msg = f"Unbound {host_target}"
+                          else:
+                              raise ValueError(f"Unknown action: {action}")
+
+                          self.send_response(200)
+                          self.end_headers()
+                          self.wfile.write(msg.encode())
+                      except Exception:
+                          err = traceback.format_exc()
+                          self.send_response(500)
+                          self.end_headers()
+                          self.wfile.write(err.encode())
+
+              HTTPServer(('localhost', 9090), Handler).serve_forever()
+      volumes:
+        - name: host-root
+          hostPath:
+            path: /
+---
+apiVersion: extensions.agents.x-k8s.io/v1beta1
+kind: SandboxTemplate
+metadata:
+  name: agent-latebind-av-template
+  namespace: default
+spec:
+  podTemplate:
+    metadata:
+      labels:
+        app: agent-sandbox-latebind
+      annotations:
+        # 要求 GKE >= 1.36.0-gke.3302001，允许宿主机在 emptyDir 内的动态挂载穿透进 gVisor 沙箱
+        dev.gvisor.empty-dir.workspace-volume.force-shared: "true"
+    spec:
+      runtimeClassName: gvisor
+      automountServiceAccountToken: false
+      nodeSelector:
+        sandbox.gke.io/runtime: gvisor
+      tolerations:
+        - key: "sandbox.gke.io/runtime"
+          value: "gvisor"
+          effect: "NoSchedule"
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 1000
+        runAsGroup: 1000
+        fsGroup: 1000
+      containers:
+        - name: agent
+          image: python:3.11-slim
+          imagePullPolicy: IfNotPresent
+          securityContext:
+            allowPrivilegeEscalation: false
+            runAsNonRoot: true
+            capabilities:
+              drop: ["ALL"]
+          env:
+            - name: MOUNT_PATH
+              value: "/mnt/latebind-root"
+          command: ["python3", "-u", "-c"]
+          args:
+            - |
+              import os
+              from http.server import BaseHTTPRequestHandler, HTTPServer
+
+              root = os.environ.get("MOUNT_PATH", "/mnt/latebind-root")
+              ws = os.path.join(root, "workspace")
+              os.makedirs(ws, exist_ok=True)
+
+              class AgentHandler(BaseHTTPRequestHandler):
+                  def do_GET(self):
+                      ready = os.path.exists(os.path.join(root, ".ready"))
+                      self.send_response(200)
+                      self.end_headers()
+                      self.wfile.write(f"ok|latebind_ready={ready}\n".encode())
+                  def log_message(self, format, *args):
+                      return
+
+              HTTPServer(("0.0.0.0", 8080), AgentHandler).serve_forever()
+          ports:
+            - containerPort: 8080
+          readinessProbe:
+            httpGet:
+              path: /
+              port: 8080
+            periodSeconds: 1
+          volumeMounts:
+            - name: workspace-volume
+              mountPath: /mnt/latebind-root
+              mountPropagation: HostToContainer
+          resources:
+            requests: { cpu: "250m", memory: "512Mi" }
+            limits: { cpu: "1", memory: "1Gi" }
+      volumes:
+        - name: workspace-volume
+          emptyDir: {}
+---
+apiVersion: extensions.agents.x-k8s.io/v1beta1
+kind: SandboxWarmPool
+metadata:
+  name: agent-latebind-av-pool
+  namespace: default
+spec:
+  replicas: 2
+  sandboxTemplateRef:
+    name: agent-latebind-av-template

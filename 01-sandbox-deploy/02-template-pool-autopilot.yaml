@@ -1,0 +1,97 @@
+# Autopilot 适配清单:ComputeClass(快照不支持 E2,钉 N2/C3)+ 模板 + 热池
+# 与 Standard 版(01-template-pool.yaml)的差异只有:podTemplate 增加
+# nodeSelector 指向 ComputeClass。
+apiVersion: cloud.google.com/v1
+kind: ComputeClass
+metadata:
+  name: sandbox-snap
+spec:
+  priorities:
+    - machineFamily: n2
+    - machineFamily: c3
+---
+apiVersion: extensions.agents.x-k8s.io/v1beta1
+kind: SandboxTemplate
+metadata:
+  name: openclaw-template
+  namespace: default
+spec:
+  service: true
+  podTemplate:
+    metadata:
+      labels:
+        sandbox: openclaw-poc
+    spec:
+      runtimeClassName: gvisor
+      nodeSelector:
+        cloud.google.com/compute-class: sandbox-snap
+      automountServiceAccountToken: false
+      securityContext:
+        runAsUser: 1000
+        runAsGroup: 1000
+        fsGroup: 1000
+      containers:
+        - name: openclaw
+          # 交付客户前替换为客户镜像地址（${OPENCLAW_IMAGE}）；当前为内部验证环境值
+          image: us-central1-docker.pkg.dev/${PROJECT_ID}/ghcr/openclaw/openclaw:2026.3.23
+          imagePullPolicy: IfNotPresent
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: false
+            runAsNonRoot: true
+            capabilities:
+              drop: ["ALL"]
+          env:
+            - name: OPENCLAW_GATEWAY_TOKEN
+              value: "dummy-token-for-sandbox"
+            - name: OPENCLAW_CONFIG_PATH
+              value: "/home/node/.openclaw/openclaw.json"
+          command: ["sh", "-c"]
+          args:
+            - |
+              [ -f /home/node/.openclaw/openclaw.json ] || cp /etc/openclaw/openclaw.json /home/node/.openclaw/openclaw.json && \
+              exec node dist/index.js gateway --bind=lan --port 18789 --allow-unconfigured --verbose
+          ports:
+            - containerPort: 18789
+            - containerPort: 18790
+          volumeMounts:
+            - mountPath: /home/node/.openclaw/workspace
+              name: workspaces-pvc
+            - mountPath: /home/node/.openclaw
+              name: config-volume
+            - mountPath: /etc/openclaw/openclaw.json
+              name: cm-volume
+              subPath: openclaw.json
+          resources:
+            requests: { cpu: "500m", memory: "2Gi" }
+            limits: { cpu: "2", memory: "4Gi" }
+      volumes:
+        - name: config-volume
+          emptyDir: {}
+        - name: cm-volume
+          configMap:
+            name: openclaw-config
+        - name: workspaces-pvc
+          ephemeral:
+            volumeClaimTemplate:
+              spec:
+                # Filestore multishare(官方 Agent Sandbox 存储推荐,RWX/亚秒级挂载):
+                # 贵操作是"切 share"(实例级串行,≈4-6s/个)——靠热池预切摊平;挂载已有 share 亚秒级
+                # 注意:模板改存储属"深改",必须先清空全部 PodSnapshot(模板 hash 不含存储,旧快照会毒害新 pod)
+                accessModes: ["ReadWriteMany"]
+                storageClassName: "openclaw-fsms"
+                resources:
+                  requests:
+                    storage: 10Gi
+---
+apiVersion: extensions.agents.x-k8s.io/v1beta1
+kind: SandboxWarmPool
+metadata:
+  name: openclaw-pool
+  namespace: default
+spec:
+  replicas: 2
+  sandboxTemplateRef:
+    name: openclaw-template
+  updateStrategy:
+    type: Recreate

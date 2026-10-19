@@ -1,0 +1,1234 @@
+<!DOCTYPE html>
+<html lang="zh" data-theme="dark">
+<head>
+<meta charset="utf-8">
+<title>OpenClaw 沙箱运营台</title>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<script src="https://cdn.jsdelivr.net/npm/echarts@5.5.0/dist/echarts.min.js"></script>
+<style>
+  /* 调色板:dataviz 参考实例(暗面) —— CPU 恒蓝 / 内存 恒橙,状态色固定四档 */
+  :root {
+    --bg:#141413; --surface:#1a1a19; --line:#33332f;
+    --ink:#ffffff; --ink2:#c3c2b7; --ink3:#8a897f;
+    --cpu:#3987e5; --mem:#d95926; --aqua:#199e70; --violet:#9085e9;
+    --good:#0ca30c; --warn:#fab219; --crit:#d03b3b;
+    --accent:#3987e5;
+  }
+  * { box-sizing:border-box; }
+  body { margin:0; font:14px/1.6 system-ui,"PingFang SC","Microsoft YaHei",sans-serif;
+         color:var(--ink); background:var(--bg); }
+  header { background:var(--surface); border-bottom:1px solid var(--line);
+           padding:13px 26px; display:flex; align-items:center; gap:14px;
+           position:sticky; top:0; z-index:5; }
+  header h1 { font-size:16px; margin:0; letter-spacing:.5px; }
+  header h1 b { color:var(--cpu); }
+  header .who { margin-left:auto; color:var(--ink2); font-size:13px; }
+  main { max-width:1280px; margin:20px auto; padding:0 20px; }
+  .card { background:var(--surface); border:1px solid var(--line); border-radius:12px;
+          padding:18px 20px; margin-bottom:16px; }
+  h3 { margin:0 0 12px; font-size:14px; color:var(--ink2); font-weight:600;
+       letter-spacing:.4px; }
+  table { width:100%; border-collapse:collapse; }
+  th,td { text-align:left; padding:9px 10px; border-bottom:1px solid var(--line); }
+  th { color:var(--ink3); font-weight:500; font-size:12px; }
+  tr.row { cursor:pointer; } tr.row:hover td { background:#20201e; }
+  .state { display:inline-flex; align-items:center; gap:5px; padding:1px 10px;
+           border-radius:999px; font-size:12px; border:1px solid transparent; }
+  .state::before { content:""; width:7px; height:7px; border-radius:50%; background:currentColor; }
+  .state.运行中 { color:var(--good); border-color:#0ca30c44; }
+  .state.已休眠 { color:var(--violet); border-color:#9085e944; }
+  .state.启动中,.state.分配中 { color:var(--warn); border-color:#fab21944; }
+  .state.异常 { color:var(--crit); border-color:#d03b3b55; }
+  button { border:1px solid var(--line); background:#232320; color:var(--ink2);
+           border-radius:8px; padding:5px 12px; margin-right:6px; cursor:pointer; font-size:13px; }
+  button:hover { border-color:var(--ink3); color:var(--ink); }
+  button.primary { background:var(--cpu); border-color:var(--cpu); color:#fff; }
+  button.danger { color:var(--crit); }
+  button:disabled { opacity:.35; cursor:default; }
+  input { border:1px solid var(--line); background:#111110; color:var(--ink);
+          border-radius:8px; padding:7px 10px; }
+  #toasts { position:fixed; right:20px; bottom:20px; display:flex; flex-direction:column; gap:8px; z-index:20; }
+  .toast { background:#26261f; color:var(--ink); border:1px solid var(--line);
+           border-left:3px solid var(--good); border-radius:8px; padding:10px 14px;
+           max-width:430px; font-size:13px; }
+  .toast.error { border-left-color:var(--crit); }
+  .addr { font-family:ui-monospace,monospace; font-size:12px; color:var(--ink3); }
+  .hint { color:var(--ink3); font-size:12px; }
+  /* KPI */
+  .kpis { display:grid; grid-template-columns:repeat(auto-fit,minmax(140px,1fr)); gap:10px; }
+  .kpi { border:1px solid var(--line); border-radius:10px; padding:11px 14px; background:#1d1d1b; }
+  .kpi .v { font-size:24px; font-weight:660; line-height:1.25; font-variant-numeric:tabular-nums; }
+  .kpi .l { color:var(--ink3); font-size:11.5px; letter-spacing:.3px; }
+  .kpi .s { color:var(--ink3); font-size:11px; margin-top:2px; }
+  .kpi.alert .v { color:var(--crit); }
+  /* 图表区 */
+  .charts { display:grid; grid-template-columns:1fr 1.3fr 1.6fr; gap:16px; }
+  .chart { height:230px; }
+  @media (max-width:1000px){ .charts{grid-template-columns:1fr;} }
+  /* 详情抽屉 */
+  #drawer { position:fixed; top:0; right:-480px; width:460px; height:100vh;
+            background:var(--surface); border-left:1px solid var(--line); z-index:10;
+            transition:right .25s ease; padding:22px; overflow-y:auto; }
+  #drawer.open { right:0; box-shadow:-18px 0 40px rgba(0,0,0,.5); }
+  #drawer h2 { margin:0 0 4px; font-size:18px; }
+  .kv { display:grid; grid-template-columns:96px 1fr; gap:4px 10px; font-size:13px; margin:12px 0; }
+  .kv .k { color:var(--ink3); } .kv .val { color:var(--ink2); word-break:break-all; }
+  .meter { height:7px; background:#111110; border-radius:4px; overflow:hidden; margin:3px 0 8px; }
+  .meter i { display:block; height:100%; border-radius:4px; }
+  .tabs { display:flex; border-bottom:1px solid var(--line); margin:14px 0 16px; }
+  .tab { padding:8px 16px; cursor:pointer; color:var(--ink3); border-bottom:2px solid transparent; }
+  .tab.active { color:var(--cpu); border-bottom-color:var(--cpu); font-weight:600; }
+  label { display:block; margin-bottom:12px; font-size:13px; color:var(--ink3); }
+  label input { display:block; width:100%; margin-top:4px; font-size:14px; }
+  .tabbtn { background:transparent; border:none; color:var(--ink3); font-size:13.5px;
+            padding:6px 12px; border-radius:8px; }
+  .tabbtn.active { color:var(--ink); background:#232320; }
+  .steps { margin:10px 0; }
+  .steps .st { display:flex; gap:10px; align-items:baseline; padding:6px 0;
+               border-bottom:1px dashed var(--line); font-size:13px; }
+  .st .ico { width:18px; } .st .sec { margin-left:auto; color:var(--cpu);
+             font-variant-numeric:tabular-nums; white-space:nowrap; }
+  .scen { display:grid; grid-template-columns:1fr 1fr; gap:16px; }
+  @media (max-width:1000px){ .scen{grid-template-columns:1fr;} }
+  .scen .card h3 { color:var(--ink); font-size:15px; }
+  .scen .desc { color:var(--ink3); font-size:12.5px; margin:4px 0 12px; min-height:34px; }
+  input[type=range] { width:100%; accent-color:var(--cpu); }
+  .simrow { display:grid; grid-template-columns:130px 1fr 90px; gap:10px;
+            align-items:center; margin-bottom:8px; font-size:13px; color:var(--ink2); }
+  .simrow output { color:var(--ink); font-weight:600; text-align:right; }
+  /* 存储分层与 SQLite 监控徽章 */
+  .tier-badge { display:inline-flex; align-items:center; gap:4px; padding:1px 8px;
+                border-radius:6px; font-size:11.5px; font-weight:600; border:1px solid transparent; }
+  .tier-badge.t1 { background:#3987e51a; color:#6eb0ff; border-color:#3987e555; }
+  .tier-badge.t2 { background:#199e7022; color:#3be0a4; border-color:#199e7066; }
+  .io-pill { display:inline-flex; align-items:center; gap:5px; font-size:11.5px;
+             padding:1px 7px; border-radius:6px; margin-top:3px; font-variant-numeric:tabular-nums; }
+  .io-pill.good { color:#4be34b; background:#0ca30c18; }
+  .io-pill.warn { color:var(--warn); background:#fab2191c; }
+  .io-pill.crit { color:#ff6b6b; background:#d03b3b28; border:1px solid #d03b3b66; font-weight:600; }
+  .thresh-grid { display:grid; grid-template-columns:repeat(auto-fit,minmax(220px,1fr)); gap:10px; margin:10px 0; }
+  .thresh-box { border:1px solid var(--line); border-radius:9px; padding:10px 12px; background:#151514; }
+  .thresh-box .tk { font-family:ui-monospace,monospace; font-size:11.5px; color:var(--cpu); font-weight:600; }
+  .thresh-box .tn { font-size:12.5px; color:var(--ink); font-weight:600; margin-top:2px; }
+  .thresh-box .tv { font-size:11.5px; color:var(--ink3); margin-top:4px; }
+  button.upgrade-btn { background:#d9592628; border-color:var(--mem); color:#ff9d76; font-weight:600; }
+  button.upgrade-btn:hover { background:var(--mem); color:#fff; }
+  .ch-step { display:inline-flex; align-items:center; gap:3px; margin-left:4px;
+             background:#151514; border:1px solid var(--line); border-radius:6px; padding:1px 4px; font-size:11.5px; color:var(--ink2); }
+  .ch-step button { padding:0 5px; height:18px; line-height:16px; font-size:12px; border-radius:4px; margin:0; }
+</style>
+</head>
+<body>
+<header>
+  <h1>🦞 OpenClaw <b>沙箱运营台</b></h1>
+  <span class="hint">生命周期 · 休眠/唤醒 · 门户内监控</span>
+  <nav id="tabs" style="display:none;margin-left:18px">
+    <button class="tabbtn active" data-t="ops" onclick="switchTab('ops')">运营</button>
+    <button class="tabbtn" data-t="demo" onclick="switchTab('demo')">演示剧本</button>
+    <button class="tabbtn" data-t="perf" onclick="switchTab('perf')">性能实证</button>
+    <button class="tabbtn" data-t="cost" onclick="switchTab('cost')">成本推演</button>
+  </nav>
+  <span class="who" id="who"></span>
+  <button id="switchAdminBtn" class="upgrade-btn" style="display:none;margin-right:8px" onclick="switchToAdmin()">🔑 切换管理员视角(看全量监控)</button>
+  <select id="clusterSel" style="display:none;background:var(--surface);color:var(--ink);
+    border:1px solid var(--line);border-radius:6px;padding:4px 8px;margin-right:8px"
+    onchange="switchCluster(this.value)"></select>
+  <button id="logoutBtn" style="display:none" onclick="logout()">切换工号/退出</button>
+</header>
+<main>
+  <div id="loginCard" style="display:none">
+    <div class="card" style="max-width:400px;margin:9vh auto;padding:30px 34px">
+      <h2 style="margin:0 0 4px">登录</h2>
+      <p class="hint" style="margin-top:0">入口已由 IAP 门禁保护；请使用工号密码登录（此处对接客户员工认证体系）</p>
+      <div class="tabs">
+        <div class="tab active" id="tabUser" onclick="setRole('user')">员工登录</div>
+        <div class="tab" id="tabAdmin" onclick="setRole('admin')">管理员登录</div>
+      </div>
+      <label>工号<input id="empInput" placeholder="如 10001" autocomplete="username"></label>
+      <label>密码<input id="pwdInput" type="password" placeholder="统一访问密码" autocomplete="current-password"
+             onkeydown="if(event.key==='Enter')login()"></label>
+      <div id="loginErr" style="color:var(--crit);font-size:13px;min-height:18px"></div>
+      <button class="primary" style="width:100%;padding:9px" onclick="login()">登 录</button>
+    </div>
+  </div>
+
+  <div id="adminZone" data-tab="ops" style="display:none">
+    <div class="card"><h3>舰队概览</h3><div class="kpis" id="kpis"></div></div>
+    <div class="card">
+      <h3>现在来新用户，要等多久？ <span class="hint">（四档等待时间的余量一览；一格 = 一个能马上安置龙虾的位置）</span></h3>
+      <div id="supplySummary" style="font-size:13.5px;color:var(--ink2);margin:2px 0 10px"></div>
+      <div id="supplyChart" style="min-height:210px"></div>
+    </div>
+    <div class="charts">
+      <div class="card"><h3>舰队状态</h3><div id="chartFleet" class="chart"></div></div>
+      <div class="card"><h3>节点资源（实时用量 / 可分配）</h3><div id="chartNodes" class="chart"></div></div>
+      <div class="card"><h3>近 2 小时趋势</h3><div id="chartTrend" class="chart"></div></div>
+    </div>
+  </div>
+
+  <div class="card" id="storageMonitorCard" data-tab="ops" style="display:none">
+    <div style="display:flex;align-items:center;flex-wrap:wrap;gap:10px;margin-bottom:6px">
+      <h3 style="margin:0">🔬 双层分级存储与 SQLite 实时监控大盘 <span class="hint">（从 Tier 1 Filestore 自动升配至 Tier 2 Hyperdisk SSD 的 4 大技术观测指标）</span></h3>
+      <span style="margin-left:auto;font-size:12px;color:var(--ink3)">📡 <b>采集模式</b>：生产常规走 <b>集中式采集（FluentBit 结构化日志 / GMP Prometheus → 门户中心状态表，零 exec 开销）</b>；点击单行「📊 详情与监控」可按需触发单实例 <code>kubectl exec node:sqlite</code> 实盘探针</span>
+    </div>
+    <div class="thresh-grid">
+      <div class="thresh-box">
+        <div class="tk">① sqlite_write_tx_p95_ms</div>
+        <div class="tn">SQLite 写事务 P95 耗时</div>
+        <div class="tv">🟢 &lt;10ms · 🟡 10~15ms · <b style="color:#ff6b6b">🔴 &gt;15ms 触发升配</b><br>实测：Filestore 调优(1~8通道错峰) 6.07~8.8ms / ≥13通道并发 16~23ms / Hyperdisk <b>0.039ms</b></div>
+      </div>
+      <div class="thresh-box">
+        <div class="tk">② nodejs_eventloop_lag_p99_ms</div>
+        <div class="tn">Gateway 事件循环阻塞滞后</div>
+        <div class="tv">🟢 &lt;250ms · 🟡 250~1000ms · <b style="color:#ff6b6b">🔴 &gt;1000ms 触发升配</b><br>实测：17 飞书账号并发 Filestore 阻塞 5,275ms / Hyperdisk <b>40.3ms</b></div>
+      </div>
+      <div class="thresh-box">
+        <div class="tk">③ session_locks_scan_ms</div>
+        <div class="tn">.openclaw 目录锁扫描耗时</div>
+        <div class="tv">🟢 &lt;50ms · 🟡 50~200ms · <b style="color:#ff6b6b">🔴 &gt;200ms 触发归档/升配</b><br>配合 <code>initContainer + emptyDir</code> 将 doctor 修复从 44.8s 降至 <b>4.67s</b></div>
+      </div>
+      <div class="thresh-box">
+        <div class="tk">④ bound_feishu_accounts</div>
+        <div class="tn">单实例挂载飞书账号/群通道数</div>
+        <div class="tv">🟢 1~8 通道(日常错峰) · 🟡 9~12 通道 · <b style="color:#ff6b6b">🔴 ≥13 通道触发升配</b><br>按 ~30% 同秒并发率折算：≥13 通道高峰同秒并发 ≥5（单轮 328ms×5 &gt; 1s 阻塞红线）</div>
+      </div>
+    </div>
+    <div id="storageAlertBanner" style="margin-top:8px"></div>
+  </div>
+
+  <div class="card" id="mainCard" data-tab="ops" style="display:none">
+    <div style="display:flex;align-items:center;margin-bottom:10px">
+      <h3 style="margin:0">沙箱实例 <span class="hint">（点击行查看详情与 SQLite 实时探针，勾选可批量操作）</span></h3>
+      <span id="batchBar" style="display:none;margin-left:14px">
+        <span class="hint" id="selCount" style="margin-right:6px"></span>
+        <button onclick="batchAct('hibernate','休眠')">批量休眠</button>
+        <button onclick="batchAct('wake','唤醒')">批量唤醒</button>
+        <button class="danger" id="batchDelBtn" onclick="batchDel()">批量删除</button>
+      </span>
+      <span style="margin-left:auto">
+        <input id="newEmp" placeholder="工号(管理员可代开)" style="display:none">
+        <button class="primary" id="createBtn" onclick="createInst()">＋ 新建/领取实例</button>
+        <button onclick="refresh()">刷新</button>
+      </span>
+    </div>
+    <table>
+      <thead><tr><th style="width:26px"><input type="checkbox" id="selAll" onclick="toggleAll(this.checked)"></th>
+                 <th>工号</th><th>实例</th><th>状态</th><th style="width:185px">CPU / 内存（用量/申报）</th>
+                 <th style="width:250px">存储层级 · SQLite 实时监控</th><th>快照</th><th>操作</th></tr></thead>
+      <tbody id="rows"></tbody>
+    </table>
+  </div>
+
+  <div class="card" id="auditCard" data-tab="ops" style="display:none">
+    <h3>审计日志 <span class="hint">（完整历史见 Cloud Logging，检索 "AUDIT"）</span></h3>
+    <table><thead><tr><th>时间</th><th>操作者</th><th>动作</th><th>对象</th><th>备注</th></tr></thead>
+      <tbody id="auditRows"></tbody></table>
+  </div>
+
+  <!-- ===== 演示剧本 ===== -->
+  <div data-tab="demo" style="display:none">
+    <div class="scen">
+      <div class="card"><h3>🌊 发放风暴</h3>
+        <div class="desc">批量认领 N 个工号并逐个秒表计时——现场验证"热池深度 = 秒级服务能力"，溢出者自动掉到现场新建档。</div>
+        并发数 <input id="stormN" type="number" value="5" min="1" max="12" style="width:64px">
+        <select id="stormMode" style="background:var(--surface);color:var(--ink);border:1px solid var(--line);border-radius:6px;padding:5px 8px">
+          <option value="anon" selected>WarmPool 预热池并发秒级认领(默认,秒级全绿)</option>
+          <option value="demo">预切演示盘 demo01~N(考验并行构建)</option>
+        </select>
+        <button class="primary" onclick="runStorm()">开跑</button>
+        <button onclick="cleanupStorm()" id="stormClean" disabled>清理本轮实例</button>
+        <div id="stormNote" class="hint" style="margin-top:6px"></div>
+        <div id="stormChart" style="height:200px;margin-top:8px"></div>
+      </div>
+      <div class="card"><h3>💤 休眠之旅</h3>
+        <div class="desc">选一只龙虾：写入记忆 → 休眠（快照+资源归零）→ 唤醒（真恢复校验）→ 记忆完好。状态零丢失的全程铁证。</div>
+        工号 <select id="journeyEmp" style="border:1px solid var(--line);background:#111110;color:var(--ink);border-radius:8px;padding:6px"></select>
+        <button class="primary" onclick="runJourney()">出发</button>
+      </div>
+      <div class="card"><h3>🌙 下班 / 上班模式</h3>
+        <div class="desc">一键全员休眠——看概览页成本估算坠落归零；一键全员唤醒——记忆全部完好。成本故事的现场版。</div>
+        <button class="primary" onclick="runOffwork('sleep')">🌙 全员下班（休眠）</button>
+        <button class="primary" onclick="runOffwork('wakeup')">☀️ 全员上班（唤醒）</button>
+      </div>
+      <div class="card"><h3>🔄 升级演练</h3>
+        <div class="desc">发布新模板版本 → 热池自动滚动 → 新领取即新版 → 存量实例零打扰。9000 规模更新机制的缩样演示。</div>
+        <button class="primary" onclick="runUpgrade()">发布一个新版本</button>
+      </div>
+      <div class="card" style="grid-column:1 / -1;border-color:#d9592677">
+        <h3>🔥 剧本⑤：存储压力监控告警与一键热升配（Tier 1 Filestore → Tier 2 Hyperdisk SSD）</h3>
+        <div class="desc">模拟客户最关心的落地闭环：① 初始运行在低成本共享 Filestore（1账号稳态 P95=6.07ms）→ ② 挂载 <b>17 个飞书账号并发</b>收发消息 → ③ 实时监控捕获 <code>SQLite P95 &gt; 15ms</code> 与 <code>EventLoop 阻塞 &gt; 1000ms</code> 告警变红 → ④ 触发在线热迁移升配至 <code>Hyperdisk Balanced SSD</code>（50.8MB 状态目录切换仅 <b>1.77s</b>）→ ⑤ 17 账号同压复测 P95 暴降至 <b>0.068ms</b>（提速 298 倍）。</div>
+        演练工号 <select id="tieringEmp" style="border:1px solid var(--line);background:#111110;color:var(--ink);border-radius:8px;padding:6px;margin-right:8px"></select>
+        <button class="upgrade-btn" onclick="runStorageTieringDemo()">🚀 演练：17账号压测告警 → 在线热升配 SSD</button>
+        <span class="hint" style="margin-left:8px">（也可在「运营」页点击任意实例行，在右侧抽屉中单独触发探针与升配）</span>
+      </div>
+    </div>
+    <div class="card" id="scenPanel" style="display:none">
+      <h3 id="scenTitle"></h3>
+      <div class="steps" id="scenSteps"></div>
+      <div class="hint" id="scenDetail"></div>
+      <div id="scenStorageResult" style="margin-top:10px"></div>
+    </div>
+  </div>
+
+  <!-- ===== 性能实证 ===== -->
+  <div data-tab="perf" style="display:none">
+    <div class="card">
+      <div style="display:flex;align-items:center">
+        <h3>实测账本 <span class="hint">（本环境实测值；期望列为方案量级，非承诺值）</span></h3>
+        <button style="margin-left:auto" onclick="exportCsv()">导出 CSV</button>
+      </div>
+      <div class="kpis" id="perfKpis" style="margin:10px 0"></div>
+      <div id="perfChart" style="height:260px"></div>
+      <p class="hint">口径：演示环境（Autopilot / n2-standard-4）实测；容量与密度类指标须在专项测试集群另测。</p>
+    </div>
+    <div class="card">
+      <h3>🧪 GKE 纯 gVisor 沙箱：双层分级存储与 SQLite 实盘压测对标 <span class="hint">（Filestore Zonal SSD vs pd-balanced vs Hyperdisk Balanced 对标阿里 ESSD）</span></h3>
+      <div class="kpis" style="margin:10px 0">
+        <div class="kpi"><div class="l">Hyperdisk 真落盘 fsync P50</div><div class="v" style="color:var(--aqua)">1.544ms</div><div class="s">比阿里 ESSD (2.54ms) 快 39%</div></div>
+        <div class="kpi"><div class="l">Hyperdisk SQLite 写事务 P50</div><div class="v" style="color:var(--cpu)">0.039ms</div><div class="s">14,848 TPS · 比 NFS 快 520 倍</div></div>
+        <div class="kpi"><div class="l">17 飞书账号并发单轮阻塞</div><div class="v" style="color:var(--good)">40.3ms</div><div class="s">Filestore 未调优为 12,290ms</div></div>
+        <div class="kpi"><div class="l">Filestore 独占锁调优提速</div><div class="v" style="color:var(--warn)">3.22x</div><div class="s">P50 从 20.28ms 降至 6.07ms</div></div>
+        <div class="kpi"><div class="l">doctor --fix (2000会话)</div><div class="v" style="color:var(--violet)">4.67s</div><div class="s">initContainer+emptyDir 提速 9.58x</div></div>
+        <div class="kpi"><div class="l">Tier1 → Tier2 热升配窗口</div><div class="v" style="color:var(--mem)">1.77s</div><div class="s">50.8MB 状态目录 · integrity=ok</div></div>
+      </div>
+      <div id="storageBenchChart" style="height:260px;margin:12px 0"></div>
+      <table>
+        <thead>
+          <tr><th>存储档位与运行形态（全部运行在纯 gVisor 沙箱）</th><th>SQLite PRAGMA 模式</th><th>1000×1KB 写入</th><th>真落盘 fsync P50</th><th>SQLite 写事务 P50 / TPS</th><th>1 / 5 / 17 飞书账号阻塞</th><th>人均月成本</th></tr>
+        </thead>
+        <tbody id="storageBenchRows"></tbody>
+      </table>
+    </div>
+  </div>
+
+  <!-- ===== 成本推演 ===== -->
+  <div data-tab="cost" style="display:none">
+    <div class="charts" style="grid-template-columns:1fr 1.6fr">
+      <div class="card"><h3>规模推演器 <span class="hint">（示意模型，含计算 + 快照 + 双层分级存储）</span></h3>
+        <div class="simrow"><span>员工规模</span><input type="range" id="simE" min="100" max="10000" step="100" value="9000" oninput="simulate()"><output id="simEo">9000</output></div>
+        <div class="simrow"><span>并发活跃比</span><input type="range" id="simA" min="5" max="100" step="5" value="30" oninput="simulate()"><output id="simAo">30%</output></div>
+        <div class="simrow"><span>非活跃处置</span>
+          <select id="simH" onchange="simulate()" style="border:1px solid var(--line);background:#111110;color:var(--ink);border-radius:8px;padding:5px">
+            <option value="hib" selected>休眠（快照，计算费归零）</option>
+            <option value="live">保持在线</option>
+          </select><output></output></div>
+        <div class="simrow"><span>承载机型</span>
+          <select id="simM" onchange="simulate()" style="border:1px solid var(--line);background:#111110;color:var(--ink);border-radius:8px;padding:5px">
+            <option value="n2-standard-4">n2-standard-4（约5只/台）</option>
+            <option value="n2-standard-8">n2-standard-8（约12只/台）</option>
+            <option value="n2-standard-48" selected>n2-standard-48（约85只/台）</option>
+          </select><output></output></div>
+        <div class="simrow"><span>存储分层策略</span>
+          <select id="simS" onchange="simulate()" style="border:1px solid var(--line);background:#111110;color:var(--ink);border-radius:8px;padding:5px">
+            <option value="hybrid80_20" selected>80/20 双层混合（80% Filestore + 20% Hyperdisk SSD）</option>
+            <option value="filestore100">100% Tier 1 · Filestore Zonal SSD 共享盘</option>
+            <option value="pd100">100% Tier 2A · pd-balanced 独享块盘 (10Gi)</option>
+            <option value="hd100">100% Tier 2B · Hyperdisk Balanced 独享块盘 (10Gi)</option>
+          </select><output id="simSo"></output></div>
+        <div id="simSummary" style="margin-top:12px;font-size:13px;color:var(--ink2)"></div>
+      </div>
+      <div class="card"><h3>三种形态月总成本对比（计算 + 快照 + 存储分层）</h3><div id="simChart" style="height:280px"></div></div>
+    </div>
+  </div>
+</main>
+
+<div id="drawer">
+  <div style="display:flex;align-items:center">
+    <h2 id="dTitle"></h2>
+    <button style="margin-left:auto" onclick="closeDrawer()">✕</button>
+  </div>
+  <div id="dBody"></div>
+</div>
+<div id="toasts"></div>
+
+<script>
+let ME = null, ROLE = 'user', CHARTS = {}, CURTAB = 'ops';
+let STORMPREFIX = null, STORM_CHART = null, PERF_CHART = null, SIM_CHART = null, STORAGE_BENCH_CHART = null;
+const $ = id => document.getElementById(id);
+const C = { cpu:'#3987e5', mem:'#d95926', aqua:'#199e70', violet:'#9085e9',
+            good:'#0ca30c', warn:'#fab219', crit:'#d03b3b',
+            ink:'#ffffff', ink2:'#c3c2b7', ink3:'#8a897f', line:'#33332f' };
+
+function toast(msg, err=false) {
+  const el = document.createElement('div');
+  el.className = 'toast' + (err ? ' error' : '');
+  el.textContent = msg; $('toasts').appendChild(el);
+  setTimeout(() => el.remove(), 6500);
+}
+async function api(path, opts={}) {
+  const r = await fetch(path, {headers:{'Content-Type':'application/json'}, ...opts});
+  if (!r.ok) throw new Error((await r.json().catch(()=>({}))).detail || r.status);
+  return r.json();
+}
+function setRole(r) {
+  ROLE = r;
+  $('tabUser').classList.toggle('active', r==='user');
+  $('tabAdmin').classList.toggle('active', r==='admin');
+  if (r==='admin' && !$('empInput').value) $('empInput').value = 'admin';
+  if (r==='user' && $('empInput').value === 'admin') $('empInput').value = '';
+  $('loginErr').textContent = '';
+}
+async function boot() {
+  ME = await api('/api/me');
+  if (!ME.employee) { $('loginCard').style.display=''; return; }
+  $('who').textContent = (ME.admin ? '管理员 ' : '员工 ') + (ME.email || ME.employee) + ` (工号 ${ME.employee})`;
+  $('logoutBtn').style.display = (ME.mode === 'password' || ME.mode === 'gateway-sso') ? '' : 'none';
+  if ($('switchAdminBtn')) $('switchAdminBtn').style.display = ME.admin ? 'none' : '';
+  $('loginCard').style.display='none';
+  $('mainCard').style.display='';
+  $('storageMonitorCard').style.display='';
+  loadClusters();
+  $('newEmp').style.display = ME.admin ? '' : 'none';
+  $('adminZone').style.display = ME.admin ? '' : 'none';
+  $('auditCard').style.display = ME.admin ? '' : 'none';
+  $('tabs').style.display = ME.admin ? '' : 'none';
+  refresh(); setInterval(refresh, 8000);
+  if (ME.admin) { initCharts(); loadAdmin(); setInterval(loadAdmin, 15000); }
+}
+
+function switchTab(t) {
+  CURTAB = t;
+  document.querySelectorAll('[data-tab]').forEach(el =>
+    el.style.display = (el.dataset.tab === t) ? '' : 'none');
+  document.querySelectorAll('.tabbtn').forEach(b =>
+    b.classList.toggle('active', b.dataset.t === t));
+  if (t === 'demo') setTimeout(restoreLastStorm, 60);
+  if (t === 'ops') {
+    $('adminZone').style.display = ME.admin ? '' : 'none';
+    $('auditCard').style.display = ME.admin ? '' : 'none';
+    $('storageMonitorCard').style.display = '';
+    $('mainCard').style.display = '';
+    setTimeout(() => Object.values(CHARTS).forEach(c => c.resize()), 50);
+  }
+  if (t === 'demo') fillJourneySelect();
+  if (t === 'perf') loadPerf();
+  if (t === 'cost') { initSim(); simulate(); }
+}
+
+/* ---------- 演示剧本 ---------- */
+function watchScenario(taskId, title) {
+  $('scenPanel').style.display = '';
+  $('scenTitle').textContent = title;
+  $('scenSteps').innerHTML = ''; $('scenDetail').textContent = '';
+  if ($('scenStorageResult')) $('scenStorageResult').innerHTML = '';
+  const timer = setInterval(async () => {
+    const t = await api('/api/tasks/' + taskId);
+    $('scenSteps').innerHTML = (t.steps || []).map(s =>
+      `<div class="st"><span class="ico">${s.status === 'ok' ? '✅' : (s.status === 'running' ? '⏳' : '❌')}</span>
+       <span>${s.name}${s.detail ? ' — <span class="hint">' + s.detail + '</span>' : ''}</span>
+       <span class="sec">${s.seconds != null ? s.seconds + 's' : ''}</span></div>`).join('');
+    if (t.kind === 'storm') renderStorm(t.points || []);
+    if (t.storageComparison && $('scenStorageResult')) {
+      const b = t.storageComparison.before, a = t.storageComparison.after;
+      $('scenStorageResult').innerHTML = `
+        <div style="border:1px solid #199e7066;background:#199e7015;border-radius:10px;padding:12px 14px">
+          <div style="font-weight:600;color:#3be0a4;margin-bottom:6px">📊 工号 ${t.storageComparison.employee} · 热升配前后 4 大核心监控指标实测对比（17 飞书账号并发）</div>
+          <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(200px,1fr));gap:10px;font-size:12.5px">
+            <div><span class="hint">① SQLite 写事务 P95：</span><br><b style="color:#ff6b6b">${b.sqliteTxP95Ms} ms (🔴 &gt;15ms)</b> → <b style="color:#4be34b">${a.sqliteTxP95Ms} ms (🟢 提速 298x)</b></div>
+            <div><span class="hint">② EventLoop 阻塞滞后：</span><br><b style="color:#ff6b6b">${b.eventLoopLagP99Ms} ms (🔴 &gt;1000ms)</b> → <b style="color:#4be34b">${a.eventLoopLagP99Ms} ms (🟢 降 99.2%)</b></div>
+            <div><span class="hint">③ .openclaw 锁扫描：</span><br><b style="color:#ff6b6b">${b.sessionLocksScanMs} ms (🔴 &gt;200ms)</b> → <b style="color:#4be34b">${a.sessionLocksScanMs} ms (🟢 正常)</b></div>
+            <div><span class="hint">④ 存储档位与落盘模式：</span><br><span class="tier-badge t1">${b.tierLabel}</span> → <span class="tier-badge t2">${a.tierLabel}</span></div>
+          </div>
+        </div>`;
+    }
+    if (t.state !== 'running') {
+      clearInterval(timer);
+      $('scenDetail').textContent = (t.state === 'done' ? '✅ ' : '❌ ') + t.detail;
+      refresh(); if (ME.admin) loadAdmin();
+    }
+  }, 1500);
+}
+async function restoreLastStorm() {
+  // 刷新页面后,把最近一轮认领的耗时图从持久账本里重画出来(数据本来就没丢)
+  if (window._stormLive) return;          // 正在跑的实况优先,不覆盖
+  try {
+    const L = (await api('/api/ledger')).items.filter(e => e.kind === 'storm-claim');
+    if (!L.length) return;
+    const pfx = e => e.emp.slice(0, 4);
+    const last = L[L.length - 1];
+    const batch = [];
+    for (let i = L.length - 1; i >= 0; i--) {
+      if (pfx(L[i]) === pfx(last)
+          && Math.abs(new Date(L[i].ts) - new Date(last.ts)) < 10 * 60 * 1000) batch.unshift(L[i]);
+      else break;
+    }
+    if (!batch.length) return;
+    renderStorm(batch.map(e => ({emp: e.emp, seconds: e.seconds, bind: e.bind})));
+    STORMPREFIX = pfx(last);
+    $('stormClean').disabled = false;
+    $('stormNote').textContent = `↻ 上一轮结果(${last.ts.slice(5,16)},共 ${batch.length} 只)——已从账本恢复,刷新不丢;完整历史在"性能实证"页`;
+  } catch(e) {}
+}
+async function runStorm() {
+  window._stormLive = true;
+  $('stormNote').textContent = '';
+  try {
+    const n = Math.min(+$('stormN').value || 5, 12);
+    const mode = $('stormMode').value;
+    const r = await api('/api/demo/storm', {method:'POST',
+      body:JSON.stringify({count:n, tranche: mode === 'demo' ? 'demo' : undefined})});
+    STORMPREFIX = r.prefix; $('stormClean').disabled = false;
+    watchScenario(r.task, mode === 'demo'
+      ? `🌊 预切盘并发直建 ×${n}（demo01~demo${String(n).padStart(2,'0')}）`
+      : `🌊 发放风暴 ×${n}（工号前缀 ${r.prefix}）`);
+  } catch(e) { toast('启动失败: '+e.message, true); }
+}
+function renderStorm(points) {
+  if (!STORM_CHART) STORM_CHART = echarts.init($('stormChart'), null, {renderer:'svg'});
+  const ps = [...points].sort((a,b) => a.seconds - b.seconds);
+  STORM_CHART.setOption({
+    grid:{left:6,right:46,top:26,bottom:2,containLabel:true},
+    legend:{top:0,textStyle:{color:C.ink2,fontSize:11}},
+    tooltip:{backgroundColor:'#232320',borderColor:C.line,textStyle:{color:C.ink}},
+    xAxis:{type:'value',axisLabel:{color:C.ink3,fontSize:10},splitLine:{lineStyle:{color:C.line}}},
+    yAxis:{type:'category',data:ps.map(p=>p.emp),axisLabel:{color:C.ink2,fontSize:11}},
+    series:[
+      {name:'可开(含真实路径确认)',type:'bar',barWidth:10,data:ps.map(p=>p.seconds),
+        itemStyle:{color:C.cpu,borderRadius:[0,4,4,0]},
+        label:{show:true,position:'right',color:C.ink2,fontSize:11,formatter:'{c}s'}},
+      {name:'绑定(分到活龙虾)',type:'bar',barWidth:10,barGap:'-100%',z:3,
+        data:ps.map(p=>p.bind ?? 0),
+        itemStyle:{color:C.aqua,borderRadius:[0,4,4,0]},
+        // 两个口径几乎相同(差<1s)时只留外层一个数字,避免"每只两个时间"的重影
+        label:{show:true,position:'insideRight',color:'#10100f',fontSize:9,
+               formatter:d=>(d.value && ps[d.dataIndex].seconds - d.value > 1) ? d.value+'s' : ''}},
+    ]});
+}
+async function cleanupStorm() {
+  if (!STORMPREFIX) return;
+  const r = await api('/api/demo/cleanup', {method:'POST', body:JSON.stringify({prefix:STORMPREFIX})});
+  toast(`已清理 ${r.deleted} 个演示实例`); STORMPREFIX = null; $('stormClean').disabled = true; refresh();
+}
+async function fillJourneySelect() {
+  const d = await api('/api/instances');
+  const seeded = new Set(['std010','10001','10002','demo01']);
+  const running = d.items.filter(i => i.state === '运行中');
+  const realFirst = [...running].sort((a, b) => (seeded.has(a.employee) ? 1 : 0) - (seeded.has(b.employee) ? 1 : 0));
+  const opts = realFirst
+    .map(i => `<option value="${i.employee}">${i.employee} (${seeded.has(i.employee) ? '预置演示 · ' : '真实GKE沙箱 · '}${(i.storageTelemetry||{}).tierLabel||'Tier 1'})</option>`).join('') || '<option value="">（无运行中实例）</option>';
+  $('journeyEmp').innerHTML = opts;
+  if ($('tieringEmp')) {
+    const tierSort = [...running].sort((a, b) => (a.employee === '10001' ? -1 : (b.employee === '10001' ? 1 : 0)));
+    $('tieringEmp').innerHTML = tierSort
+      .map(i => `<option value="${i.employee}">${i.employee} (${(i.storageTelemetry||{}).tierLabel||'Tier 1'})</option>`).join('') || opts;
+  }
+}
+async function runJourney() {
+  const emp = $('journeyEmp').value;
+  if (!emp) return toast('没有运行中的实例，先领取或唤醒一个', true);
+  try {
+    const r = await api('/api/demo/journey', {method:'POST', body:JSON.stringify({employee:emp})});
+    watchScenario(r.task, `💤 休眠之旅 · 工号 ${emp}`);
+  } catch(e) { toast('启动失败: '+e.message, true); }
+}
+async function runStorageTieringDemo() {
+  const emp = ($('tieringEmp') && $('tieringEmp').value) || '10001';
+  try {
+    const r = await api('/api/demo/storage-tiering', {method:'POST', body:JSON.stringify({employee:emp})});
+    watchScenario(r.task, `🔥 存储监控告警与一键热升配 · 工号 ${emp}（Filestore → Hyperdisk SSD）`);
+  } catch(e) { toast('启动失败: '+e.message, true); }
+}
+async function runOffwork(a) {
+  try {
+    const r = await api('/api/demo/offwork', {method:'POST', body:JSON.stringify({action:a})});
+    watchScenario(r.task, a === 'sleep' ? '🌙 全员下班（休眠）' : '☀️ 全员上班（唤醒）');
+  } catch(e) { toast('启动失败: '+e.message, true); }
+}
+async function runUpgrade() {
+  try {
+    const r = await api('/api/demo/upgrade', {method:'POST', body:JSON.stringify({})});
+    watchScenario(r.task, '🔄 升级演练');
+  } catch(e) { toast('启动失败: '+e.message, true); }
+}
+
+/* ---------- 性能实证 ---------- */
+async function loadPerf() {
+  const L = (await api('/api/ledger')).items; window._LEDGER = L;
+  const kinds = {'storm-claim':['认领(风暴)',C.cpu], 'hibernate':['休眠',C.violet], 'wake':['唤醒',C.aqua], 'storage-upgrade':['存储热升配',C.mem]};
+  const agg = {};
+  for (const e of L) (agg[e.kind] = agg[e.kind] || []).push(e.seconds);
+  const w = L.filter(e => e.kind === 'wake'), wr = w.filter(e => e.restored).length;
+  $('perfKpis').innerHTML = Object.entries(kinds).map(([k,[n]]) => {
+    const v = (agg[k]||[]).slice().sort((a,b)=>a-b);
+    const p50 = v.length ? v[Math.floor(v.length/2)] : null;
+    return `<div class="kpi"><div class="l">${n} · P50</div><div class="v">${p50!=null?p50+'s':'—'}</div>
+      <div class="s">n=${v.length} · 区间 ${v[0]??'—'}~${v[v.length-1]??'—'}s</div></div>`;
+  }).join('') + `<div class="kpi ${w.length&&wr<w.length?'alert':''}"><div class="l">唤醒真恢复率</div>
+      <div class="v">${w.length?`${wr}/${w.length}`:'—'}</div><div class="s">静默降级应为 0</div></div>`;
+  if (!PERF_CHART) PERF_CHART = echarts.init($('perfChart'), null, {renderer:'svg'});
+  PERF_CHART.setOption({
+    tooltip:{trigger:'axis',backgroundColor:'#232320',borderColor:C.line,textStyle:{color:C.ink}},
+    legend:{top:0,textStyle:{color:C.ink2,fontSize:11}},
+    grid:{left:6,right:14,top:28,bottom:2,containLabel:true},
+    xAxis:{type:'category',data:L.map(e=>e.ts.slice(5,16)),axisLabel:{color:C.ink3,fontSize:9}},
+    yAxis:{type:'log',name:'秒(对数)',nameTextStyle:{color:C.ink3},logBase:10,
+      axisLabel:{color:C.ink3,fontSize:10},splitLine:{lineStyle:{color:C.line}}},
+    series:Object.entries(kinds).map(([k,[n,col]]) => ({
+      name:n, type:'scatter', symbolSize:9, itemStyle:{color:col},
+      data:L.map(e => e.kind===k ? e.seconds : null)}))
+      .concat([{name:'认领绑定', type:'scatter', symbolSize:7,
+        itemStyle:{color:C.aqua, opacity:.85},
+        data:L.map(e => e.kind==='storm-claim' && e.bind!=null ? e.bind : null)}])});
+  loadStorageBenchmarks();
+}
+async function loadStorageBenchmarks() {
+  try {
+    const b = await api('/api/storage/benchmarks');
+    const tiers = (b.reference || {}).tiers || [];
+    if ($('storageBenchRows')) {
+      $('storageBenchRows').innerHTML = tiers.map(t => `
+        <tr>
+          <td><b>${t.name}</b><br><span class="hint">${t.machine}</span></td>
+          <td class="addr">${t.pragma}</td>
+          <td><b>${t.fsWrite1000Ms} ms</b><br><span class="hint">五项总计 ${t.fsTotalMs} ms</span></td>
+          <td><b style="color:${t.create1kFsyncP50Ms<2?'#3be0a4':'var(--ink)'}">${t.create1kFsyncP50Ms} ms/file</b></td>
+          <td><b style="color:${t.sqliteP50Ms<1?'#3be0a4':(t.sqliteP50Ms<10?'var(--warn)':'#ff6b6b')}">P50 ${t.sqliteP50Ms} ms</b> (P95 ${t.sqliteP95Ms} ms)<br><span class="hint">${t.sqliteTps.toLocaleString()} TPS</span></td>
+          <td>1账号: <b>${t.turn1AcctMs}ms</b> · 5账号: <b>${t.turn5AcctMs}ms</b><br>17账号并发: <b style="color:${t.turn17AcctMs>1000?'#ff6b6b':'#3be0a4'}">${t.turn17AcctMs} ms</b></td>
+          <td><b>$${t.monthlyUsdPerUser.toFixed(2)}</b> /人/月</td>
+        </tr>`).join('');
+    }
+    if ($('storageBenchChart') && tiers.length) {
+      if (!STORAGE_BENCH_CHART) STORAGE_BENCH_CHART = echarts.init($('storageBenchChart'), null, {renderer:'svg'});
+      STORAGE_BENCH_CHART.setOption({
+        tooltip:{trigger:'axis',axisPointer:{type:'shadow'},backgroundColor:'#232320',borderColor:C.line,textStyle:{color:C.ink}},
+        legend:{top:0,textStyle:{color:C.ink2,fontSize:11}},
+        grid:{left:6,right:16,top:30,bottom:4,containLabel:true},
+        xAxis:{type:'category',data:tiers.map(t=>t.name.replace('Tier 1 · ','').replace('Tier 2A · ','').replace('Tier 2B · ','')),axisLabel:{color:C.ink2,fontSize:11}},
+        yAxis:{type:'log',name:'耗时 ms (对数坐标，越低越快)',nameTextStyle:{color:C.ink3},logBase:10,axisLabel:{color:C.ink3,fontSize:10},splitLine:{lineStyle:{color:C.line}}},
+        series:[
+          {name:'SQLite 写事务 P95 (ms)',type:'bar',data:tiers.map(t=>t.sqliteP95Ms),itemStyle:{color:C.cpu,borderRadius:[4,4,0,0]},label:{show:true,position:'top',color:C.ink2,fontSize:10,formatter:'{c}ms'}},
+          {name:'17 飞书账号并发阻塞 (ms)',type:'bar',data:tiers.map(t=>t.turn17AcctMs),itemStyle:{color:C.mem,borderRadius:[4,4,0,0]},label:{show:true,position:'top',color:C.ink2,fontSize:10,formatter:'{c}ms'}},
+          {name:'1000×1KB 写入耗时 (ms)',type:'bar',data:tiers.map(t=>t.fsWrite1000Ms),itemStyle:{color:C.aqua,borderRadius:[4,4,0,0]},label:{show:true,position:'top',color:C.ink2,fontSize:10,formatter:'{c}ms'}},
+        ]
+      });
+    }
+  } catch(e) {}
+}
+function exportCsv() {
+  const L = window._LEDGER || [];
+  const csv = 'ts,kind,emp,seconds,bind,restored\n'
+    + L.map(e => [e.ts,e.kind,e.emp,e.seconds,e.bind??'',e.restored??''].join(',')).join('\n');
+  const a = document.createElement('a');
+  a.href = URL.createObjectURL(new Blob([csv], {type:'text/csv'}));
+  a.download = 'poc-timings.csv'; a.click();
+}
+
+/* ---------- 成本推演 ---------- */
+const MPRICE = {'n2-standard-4':{od:0.194,slots:5}, 'n2-standard-8':{od:0.388,slots:12},
+                'n2-standard-48':{od:2.33,slots:85}};
+const SPRICE = {
+  'hybrid80_20': {perUser: 0.8*0.30 + 0.2*1.40, label: '$0.52/人'},
+  'filestore100': {perUser: 0.30, label: '$0.30/人'},
+  'pd100': {perUser: 1.00, label: '$1.00/人'},
+  'hd100': {perUser: 1.40, label: '$1.40/人'},
+};
+function initSim() { if (!SIM_CHART) SIM_CHART = echarts.init($('simChart'), null, {renderer:'svg'}); }
+function simulate() {
+  const E = +$('simE').value, a = +$('simA').value/100;
+  const hib = $('simH').value === 'hib', m = $('simM').value, mp = MPRICE[m];
+  const sMode = ($('simS') && $('simS').value) || 'hybrid80_20', sp = SPRICE[sMode] || SPRICE.hybrid80_20;
+  $('simEo').textContent = E; $('simAo').textContent = Math.round(a*100)+'%';
+  if ($('simSo')) $('simSo').textContent = sp.label;
+  const online = hib ? Math.ceil(E*a) : E;
+  const nodes = Math.ceil(online/mp.slots), nodeMo = mp.od*730;
+  const snapUsd = hib ? (E-online)*0.7*0.023 : 0;
+  const storageUsd = E * sp.perUser;
+  const auto = nodes*nodeMo*1.15 + snapUsd + storageUsd;
+  const cud  = nodes*nodeMo*0.45 + snapUsd + storageUsd;
+  const spot = nodes*nodeMo*0.30 + snapUsd + storageUsd;
+  $('simSummary').innerHTML =
+    `同时在线 <b style="color:var(--ink)">${online.toLocaleString()}</b> 只 → 需 <b style="color:var(--ink)">${nodes}</b> 台 ${m}<br>` +
+    (hib?`休眠 ${(E-online).toLocaleString()} 只 → 快照存储约 $${snapUsd.toFixed(0)}/月 · `:'') +
+    `持久化存储分层约 <b style="color:#3be0a4">$${storageUsd.toFixed(0)}/月</b> (${sp.label})<br>` +
+    `每员工月总成本：Autopilot <b>$${(auto/E).toFixed(2)}</b> · CUD <b>$${(cud/E).toFixed(2)}</b> · Spot <b>$${(spot/E).toFixed(2)}</b>`;
+  SIM_CHART.setOption({
+    tooltip:{backgroundColor:'#232320',borderColor:C.line,textStyle:{color:C.ink}},
+    grid:{left:6,right:14,top:34,bottom:2,containLabel:true},
+    xAxis:{type:'category',data:['Autopilot(整机+存储)','Standard 3年CUD+存储','Standard Spot+存储'],
+      axisLabel:{color:C.ink2,fontSize:11}},
+    yAxis:{type:'value',name:'$/月',nameTextStyle:{color:C.ink3},
+      axisLabel:{color:C.ink3,fontSize:10},splitLine:{lineStyle:{color:C.line}}},
+    series:[{type:'bar',barWidth:48,
+      data:[{value:auto.toFixed(0),itemStyle:{color:C.cpu}},
+            {value:cud.toFixed(0),itemStyle:{color:C.aqua}},
+            {value:spot.toFixed(0),itemStyle:{color:C.mem}}],
+      itemStyle:{borderRadius:[4,4,0,0]},
+      label:{show:true,position:'top',color:C.ink,formatter:p=>'$'+(+p.value).toLocaleString()}}]});
+}
+async function login() {
+  $('loginErr').textContent = '';
+  try {
+    await api('/api/login', {method:'POST', body:JSON.stringify(
+      {employee:$('empInput').value, password:$('pwdInput').value, role:ROLE})});
+    boot();
+  } catch(e) { $('loginErr').textContent = '登录失败：' + e.message; }
+}
+async function logout() { await api('/api/logout', {method:'POST'}); location.reload(); }
+async function switchToAdmin() { await api('/api/switch-admin', {method:'POST'}); location.reload(); }
+
+/* ---------- 集群切换(管理员;演示/测试两套集群共用一个 portal) ---------- */
+async function loadClusters() {
+  try {
+    const c = await api('/api/clusters');
+    if (!ME.admin || !c.items || !c.items.length) return;
+    const labelMap = {
+      'autopilot': 'Autopilot 集群 (推荐)',
+      'default': 'Autopilot 集群 (推荐)',
+      'standard': 'Standard 集群 (gVisor 节点池)'
+    };
+    $('clusterSel').innerHTML = c.items.map(n =>
+      `<option value="${n}" ${n===c.active?'selected':''}>${labelMap[n] || ('集群: ' + n)}</option>`).join('');
+    $('clusterSel').style.display = '';
+  } catch(e) {}
+}
+async function switchCluster(name) {
+  try {
+    await api('/api/clusters/active', {method:'POST', body:JSON.stringify({name})});
+    toast(`已切换到集群 ${name}`);
+    refresh(); if (ME.admin) loadAdmin();
+  } catch(e) { toast('切换失败: ' + e.message, true); loadClusters(); }
+}
+
+async function refresh() {
+  try {
+    const d = await api('/api/instances');
+    const keep = new Set(selected().map(s => s.emp));   // 自动刷新不丢勾选
+    const alerts = d.items.filter(i => (i.storageTelemetry||{}).recommendUpgrade);
+    if ($('storageAlertBanner')) {
+      if (alerts.length) {
+        $('storageAlertBanner').innerHTML = alerts.map(i => {
+          const st = i.storageTelemetry;
+          return `<div style="display:flex;align-items:center;flex-wrap:wrap;gap:10px;padding:10px 14px;border-radius:8px;background:#d03b3b22;border:1px solid #d03b3b77;margin-bottom:6px">
+            <span style="color:#ff6b6b;font-weight:700">🚨 慢事务与阻塞告警 · 工号 ${i.employee}</span>
+            <span class="tier-badge t1">${st.tierLabel}</span>
+            <span style="font-size:12.5px;color:var(--ink2)">
+              挂载 <b>${st.feishuAccounts}</b> 飞书通道 ·
+              SQLite P95 = <b style="color:#ff6b6b">${st.sqliteTxP95Ms}ms</b> (&gt;15ms) ·
+              EventLoop Lag = <b style="color:#ff6b6b">${st.eventLoopLagP99Ms}ms</b> (&gt;1000ms) ·
+              锁扫描 = <b style="color:#ff6b6b">${st.sessionLocksScanMs}ms</b>
+            </span>
+            <span style="margin-left:auto;display:flex;gap:6px">
+              <button class="upgrade-btn" onclick="upgradeStorage('${i.employee}','pro-hyperdisk')">⚡ 一键热升配至 Hyperdisk SSD (~1.77s)</button>
+              <button onclick="openDetail('${i.employee}')">查看 4 项监控详情</button>
+            </span>
+          </div>`;
+        }).join('');
+      } else {
+        $('storageAlertBanner').innerHTML = `<div style="display:flex;align-items:center;gap:10px;padding:8px 12px;border-radius:8px;background:#0ca30c14;border:1px solid #0ca30c44;font-size:12.5px;color:#4be34b">
+          <span>🟢 当前所有运行中实例 SQLite P95 &lt; 15ms、EventLoop 阻塞 &lt; 1000ms，无慢事务升配告警。</span>
+          <span style="margin-left:auto">
+            <button onclick="probeStorage((window._LAST_EMP||'std010'),'stress_17_accounts')">🔥 在实例上模拟 17 飞书账号并发冲击</button>
+          </span>
+        </div>`;
+      }
+    }
+    if (d.items.length) window._LAST_EMP = d.items[0].employee;
+    $('rows').innerHTML = d.items.map(i => {
+      const busy = i.state==='启动中'||i.state==='分配中';
+      const r = i.resources;
+      const st = i.storageTelemetry || {};
+      const isT2 = st.tier === 'pro-hyperdisk';
+      const mini = (u,q,color,unit) => u==null ? '' :
+        `<div style="display:flex;align-items:center;gap:6px;font-size:11.5px;color:var(--ink2)">
+           <span style="width:84px">${u}${unit} / ${q}${unit}</span>
+           <span class="meter" style="width:64px;margin:0"><i style="width:${Math.min(100,q?100*u/q:0).toFixed(0)}%;background:${color}"></i></span>
+         </div>`;
+      const resCell = r ? mini(r.cpuUsed,r.cpuReq,C.cpu,'C') + mini(r.memUsed,r.memReq,C.mem,'Gi')
+                        : `<span class="hint">${i.state==='已休眠'?'已释放（快照承载）':'—'}</span>`;
+      const hCls = st.health || 'good';
+      const hIcon = hCls === 'crit' ? '🔴' : (hCls === 'warn' ? '🟡' : '🟢');
+      const isRun = i.state === '运行中';
+      const stCell = isRun ? `
+        <div style="display:flex;align-items:center;flex-wrap:wrap;gap:4px">
+          <span class="tier-badge ${isT2?'t2':'t1'}">${st.tierLabel || 'Tier 1 · Filestore'}</span>
+          <span class="ch-step" onclick="event.stopPropagation()" title="增减飞书通道数（Tier1下：1~8绿 · 9~12黄 · ≥13红）">
+            <button onclick="adjustFeishu('${i.employee}',null,-1)">−</button>
+            <span><b>${st.feishuAccounts||1}</b> 飞书通道</span>
+            <button onclick="adjustFeishu('${i.employee}',null,1)">＋</button>
+          </span>
+        </div>
+        <div class="io-pill ${hCls}">
+          ${hIcon} P95: ${st.sqliteTxP95Ms??'—'}ms · Lag: ${st.eventLoopLagP99Ms??'—'}ms
+        </div>` : `
+        <div><span class="tier-badge ${isT2?'t2':'t1'}">${st.tierLabel || 'Tier 1 · Filestore'}</span>
+             <span class="hint" style="margin-left:4px">持久盘保留</span></div>
+        <div class="hint" style="margin-top:3px">💤 已休眠 · 无活跃 SQLite I/O</div>`;
+      return `<tr class="row" onclick="openDetail('${i.employee}')">
+        <td onclick="event.stopPropagation()"><input type="checkbox" class="selBox"
+            data-emp="${i.employee}" data-state="${i.state}" onchange="selBar()"></td>
+        <td><b>${i.employee}</b></td>
+        <td class="addr">${i.sandbox||'-'}</td>
+        <td><span class="state ${i.state}">${i.state}</span></td>
+        <td>${resCell}</td>
+        <td>${stCell}</td>
+        <td class="hint">${i.snapshot ? (i.snapshot.ready?'✓ ':'⏳ ') + i.snapshot.createdAt.slice(5,16) : '—'}</td>
+        <td onclick="event.stopPropagation()">
+          <button onclick="openDetail('${i.employee}')">📊 详情与监控</button>
+          ${!isT2 ? `<button class="upgrade-btn" onclick="upgradeStorage('${i.employee}','pro-hyperdisk')">⚡ 升配SSD</button>` : `<button onclick="upgradeStorage('${i.employee}','standard-filestore')">↩ 降回Tier1</button>`}
+          ${isRun && !isT2 && !st.recommendUpgrade ? `<button onclick="probeStorage('${i.employee}','stress_17_accounts')">🔥 压测17账号</button>` : ''}
+          ${i.openUrl?`<button class="primary" ${!isRun?'disabled':''} onclick="openUI('${i.employee}','${i.openUrl}')">打开</button>`:''}
+          <button ${!isRun?'disabled':''} onclick="act('${i.employee}','hibernate','休眠')">休眠</button>
+          <button ${i.state!=='已休眠'?'disabled':''} onclick="act('${i.employee}','wake','唤醒')">唤醒</button>
+          <button class="danger" ${busy?'disabled':''} onclick="del('${i.employee}')">删除</button>
+        </td></tr>`;
+    }).join('') || '<tr><td colspan="8" class="hint">暂无实例，点击"新建/领取实例"从预热池秒级领取。</td></tr>';
+    document.querySelectorAll('.selBox').forEach(b => { if (keep.has(b.dataset.emp)) b.checked = true; });
+    selBar();
+    const mine = d.items.some(i => i.employee === ME.employee);
+    $('createBtn').disabled = !ME.admin && mine;
+  } catch(e) { toast('加载失败: '+e.message, true); }
+}
+
+/* ---------- 批量操作 ---------- */
+function selected() {
+  return [...document.querySelectorAll('.selBox:checked')]
+    .map(b => ({emp: b.dataset.emp, state: b.dataset.state}));
+}
+function toggleAll(on) {
+  document.querySelectorAll('.selBox').forEach(b => b.checked = on);
+  selBar();
+}
+function selBar() {
+  const n = selected().length;
+  $('batchBar').style.display = n ? '' : 'none';
+  $('selCount').textContent = `已选 ${n} 只`;
+  const all = document.querySelectorAll('.selBox');
+  $('selAll').checked = all.length > 0 && n === all.length;
+  if (!n) disarmDel();
+}
+function waitTask(id) {
+  return new Promise(res => {
+    const t = setInterval(async () => {
+      try {
+        const s = await api('/api/tasks/' + id);
+        if (s.state !== 'running') { clearInterval(t); res(s); }
+      } catch(e) { clearInterval(t); res({state:'failed'}); }
+    }, 3000);
+  });
+}
+async function batchAct(action, label) {
+  const need = action === 'hibernate' ? '运行中' : '已休眠';
+  const sel = selected();
+  const go = sel.filter(s => s.state === need);
+  const skip = sel.length - go.length;
+  if (!go.length) { toast(`所选实例里没有「${need}」状态的,无法${label}`, true); return; }
+  toast(`批量${label}已发起:${go.length} 只并行处理中…${skip ? `(跳过 ${skip} 只状态不符)` : ''}`);
+  const rs = await Promise.allSettled(go.map(s =>
+    api(`/api/instances/${s.emp}/${action}`, {method:'POST'}).then(r => waitTask(r.task))));
+  const ok = rs.filter(r => r.status === 'fulfilled' && r.value.state === 'done').length;
+  toast(`批量${label}完成:成功 ${ok}/${go.length}${skip ? ` · 跳过 ${skip}` : ''}`, ok < go.length);
+  toggleAll(false); refresh(); if (ME.admin) loadAdmin();
+}
+let DELARM = null;   // 批量删除两步确认:第一次点击武装 5 秒,再点才执行
+function disarmDel() {
+  clearTimeout(DELARM); DELARM = null;
+  const b = $('batchDelBtn'); if (b) b.textContent = '批量删除';
+}
+async function batchDel() {
+  const sel = selected().filter(s => s.state !== '启动中' && s.state !== '分配中');
+  if (!sel.length) { toast('所选实例都在启动/分配中,暂不能删', true); return; }
+  if (!DELARM) {
+    $('batchDelBtn').textContent = `⚠ 再点一次确认删 ${sel.length} 只`;
+    DELARM = setTimeout(disarmDel, 5000);
+    return;
+  }
+  disarmDel();
+  toast(`批量删除中:${sel.length} 只…`);
+  const rs = await Promise.allSettled(sel.map(s =>
+    api('/api/instances/' + s.emp, {method:'DELETE'})));
+  const ok = rs.filter(r => r.status === 'fulfilled').length;
+  toast(`批量删除完成:成功 ${ok}/${sel.length}`, ok < sel.length);
+  toggleAll(false); refresh(); if (ME.admin) loadAdmin();
+}
+
+/* ---------- 管理员:概览 + 图表 ---------- */
+function initCharts() {
+  for (const id of ['chartFleet','chartNodes','chartTrend'])
+    CHARTS[id] = echarts.init($(id), null, {renderer:'svg'});
+  window.addEventListener('resize', () => Object.values(CHARTS).forEach(c=>c.resize()));
+}
+async function loadAdmin() {
+  try {
+    const [o, nd, hist, a] = await Promise.all([
+      api('/api/overview'), api('/api/nodes'), api('/api/metrics/history'), api('/api/audit')]);
+    renderKpis(o); renderFleet(o); renderNodes(nd.items); renderTrend(hist.items); renderAudit(a.items);
+    renderSupply(o);
+  } catch(e) { /* 静默,不打扰主流程 */ }
+}
+function renderKpis(o) {
+  const s = o.states || {}, abn = s['异常']||0;
+  const st = o.storage || {}, upAlerts = st.upgradeAlerts || 0;
+  $('kpis').innerHTML = [
+    ['注册实例', o.total, `今日新领 ${o.todayClaims??0}`, ''],
+    ['运行中', s['运行中']||0, '', ''],
+    ['已休眠', s['已休眠']||0, '计算费为 0', ''],
+    ['异常', abn, abn?'需人工介入':'一切正常', abn?'alert':''],
+    ['热池水位', `${o.pool.ready}/${o.pool.target}`,
+      `待命就绪/目标 · 已认领 ${o.total}（不占池）· 调节在下方供给图`, ''],
+    ['认领绑定 P50', o.claimBindP50!=null?`${o.claimBindP50}s`:'—', '创建→就绪', ''],
+    ['双层存储分布', `T1:${st.tier1Filestore??0} / T2:${st.tier2Hyperdisk??0}`,
+      upAlerts ? `🔴 ${upAlerts} 只触发 SQLite 升配红线` : `🟢 全部健康 · 盘 ${st.pvcGi}Gi`, upAlerts?'alert':''],
+    ['内存快照', st.snapshots, `工作盘 ${st.pvcGi}Gi`, ''],
+    ['月成本估算', `$${o.cost.monthlyUsd}`, '按申报×近似单价', ''],
+    ['唤醒质量', o.wakeQuality.total?`${o.wakeQuality.restored}/${o.wakeQuality.total}`:'—',
+      (o.wakeQuality.coldFallback?`⚠ ${o.wakeQuality.coldFallback} 次降级`:'无静默降级')
+      +(o.wakeQuality.p50?` · 中位 ${o.wakeQuality.p50}s`:''), o.wakeQuality.coldFallback?'alert':''],
+  ].map(([l,v,sub,cls]) => `<div class="kpi ${cls==='alert'?'alert':''}"><div class="l">${l}</div><div class="v">${v}</div><div class="s">${sub}</div></div>`).join('');
+}
+let CAP_BUSY = false;
+async function stepCap(kind, n) {
+  if (n < 0 || n > 50 || CAP_BUSY) return;
+  CAP_BUSY = true;
+  try {
+    if (kind === 'pool')
+      await api('/api/pool', {method:'POST', body:JSON.stringify({replicas:n})});
+    else
+      await api('/api/buffer', {method:'POST', body:JSON.stringify({strategy:kind, replicas:n})});
+    toast(({pool:'热池', active:'Active 缓冲', standby:'Standby 缓冲'})[kind] + ` 目标 → ${n} 只`);
+    await loadAdmin();
+  } catch(e) { toast('调整失败: '+e.message, true); }
+  finally { CAP_BUSY = false; }
+}
+function renderSupply(o) {
+  const sp = o.supply; if (!sp) return;
+  const sb = (sp.buffers||[]).find(b=>b.strategy==='standby');
+  const ab = (sp.buffers||[]).find(b=>b.strategy==='active');
+  const layers = [
+    {tag:'L1', n:'现货·点了就用', verb:'能秒领', v:o.pool.ready, t:o.pool.target, col:C.aqua, speed:'≈1 秒',
+     tip:`已经启动好的龙虾,认领即交付\n现有 ${o.pool.ready} 只 / 目标 ${o.pool.target} 只`},
+    {tag:'L2', n:'机器开着·现造', verb:'能现造', v:sp.activeFreeSlots, t:ab?ab.replicas:0, col:C.cpu, speed:'≈15 秒',
+     tip:`运行中机器上的空位:够放 ${sp.activeFreeSlots} 只新龙虾\n目标含义:承诺至少常备 ${ab?ab.replicas:0} 个空位`
+       + (ab ? '' : '\n(未配置保底,当前空位是自然余量)')},
+    {tag:'L3', n:'机器睡着·先叫醒', verb:'能唤醒接住', v:sp.standbySlots, t:sb?sb.replicas:0, col:C.violet, speed:'≈1 分钟',
+     tip:`挂起状态的备用机(不付计算费):${sp.standbyNodes} 台,够放 ${sp.standbySlots} 只\n目标含义:希望常备 ${sb?sb.replicas:0} 只的挂起容量`},
+    {tag:'L4', n:'现买机器', v:null, col:C.ink3, speed:'≈2 分钟',
+     tip:'兜底:现场向云端买新机器,无上限'},
+  ];
+  const MAXB = 12;   // 每柱最多显示 12 格,超出在计数里体现
+  const block = (col, ghost=false, faded=false) =>
+    `<div style="width:22px;height:15px;border-radius:3px;margin-top:3px;
+       ${ghost ? `border:1px dashed ${C.line};background:transparent;`
+               : `background:${col};${faded?'opacity:.28;':''}
+                  box-shadow:0 0 6px ${col}44;`}"></div>`;
+  $('supplyChart').innerHTML =
+    `<div style="display:flex;gap:34px;align-items:flex-end;justify-content:center;padding:6px 0 2px">`
+    + layers.map(L => {
+      let blocks;
+      if (L.v == null) {                    // L4:无上限,虚化格上加 ∞
+        blocks = `<div style="color:${C.ink3};font-size:17px;text-align:center">∞</div>`
+               + Array.from({length:5}, () => block(L.col, false, true)).join('');
+      } else {
+        // 三段式:实心=现在可用 | 半透明=超出目标的顺带余量 | 虚线=目标里还没就绪的缺口
+        const t = L.t ?? L.v;
+        const fill  = Math.min(L.v, t);
+        const extra = Math.max(L.v - t, 0);
+        const gap   = Math.max(t - L.v, 0);
+        const arr = [
+          ...Array.from({length: fill},  () => block(L.col)),
+          ...Array.from({length: extra}, () => block(L.col, false, true)),
+          ...Array.from({length: gap},   () => block(L.col, true)),
+        ];
+        blocks = arr.length
+          ? arr.slice(0, MAXB).join('')
+            + (arr.length > MAXB ? `<div class="hint" style="text-align:center">⋮</div>` : '')
+          : block(L.col, true);             // 目标 0 且实际 0:一只幽灵格占位
+      }
+      const kind = {L1:'pool', L2:'active', L3:'standby'}[L.tag];
+      const t = L.t ?? 0;
+      const bs = `width:26px;height:26px;border-radius:6px;border:1px solid var(--line);
+        background:transparent;color:var(--ink);cursor:pointer;font-size:15px;line-height:1`;
+      const stepper = kind ? `
+        <div style="display:flex;gap:7px;align-items:center;margin-bottom:6px" onclick="event.stopPropagation()">
+          <button style="${bs}" title="目标 -1" onclick="stepCap('${kind}',${t-1})">−</button>
+          <span class="hint" style="min-width:44px;text-align:center">目标 ${t}</span>
+          <button style="${bs}" title="目标 +1" onclick="stepCap('${kind}',${t+1})">＋</button>
+        </div>` : '';
+      return `<div title="${L.tip}" style="display:flex;flex-direction:column-reverse;align-items:center">
+        <div style="margin-top:8px;text-align:center">
+          <div style="font-size:12.5px;font-weight:700;color:${L.col}">${L.tag} ${L.n}</div>
+          <div class="hint">${L.speed}</div>
+        </div>
+        ${stepper}
+        <div style="display:flex;flex-direction:column-reverse;align-items:center;min-height:120px;justify-content:flex-start">
+          ${blocks}
+        </div>
+        ${L.v == null ? '' : (() => {
+          const note = L.v > t ? `<span style="color:${L.col}">比目标多备了 ${L.v-t} 只(整机附赠,白得的)</span>`
+                     : L.v < t ? `<span style="color:${C.warn}">离目标还差 ${t-L.v} 只</span>`
+                     : `✓ 按目标备足`;
+          return `<div class="hint" style="margin-bottom:2px">${note}</div>`;
+        })()}
+        <div style="font-size:19px;font-weight:700;color:var(--ink);margin-bottom:2px">
+          ${L.v == null ? '∞' : `${L.verb} ${L.v} 只`}</div>
+      </div>`;
+    }).join('')
+    + `</div>`
+    + `<div class="hint" style="text-align:center;margin-top:8px">
+        每格=能立刻安置一只龙虾的位置 · 实心=现成 · 虚线=还差的 · 半透明=白得的 · ＋/− 调目标 · 差额长期不齐=现有机器已够用,系统不会为凑数多买机器
+      </div>`;
+  // 一句人话总结:按到达顺序告诉你每一批新用户的等待档位
+  const segs = [];
+  let acc = 0;
+  if (o.pool.ready > 0) { segs.push(`第 1~${o.pool.ready} 位:约 1 秒`); acc = o.pool.ready; }
+  if (sp.activeFreeSlots > 0) { segs.push(`第 ${acc+1}~${acc+sp.activeFreeSlots} 位:约 15 秒`); acc += sp.activeFreeSlots; }
+  if (sp.standbySlots > 0) { segs.push(`第 ${acc+1}~${acc+sp.standbySlots} 位:约 1 分钟`); acc += sp.standbySlots; }
+  segs.push(`再往后:现买机器,约 2 分钟`);
+  $('supplySummary').textContent = '💬 现在如果排队来新用户 —— ' + segs.join('；') + '。';
+}
+
+function renderFleet(o) {
+  const s = o.states || {};
+  const data = [
+    {name:'运行中', value:s['运行中']||0, itemStyle:{color:C.good}},
+    {name:'已休眠', value:s['已休眠']||0, itemStyle:{color:C.violet}},
+    {name:'启动中', value:(s['启动中']||0)+(s['分配中']||0), itemStyle:{color:C.warn}},
+    {name:'异常', value:s['异常']||0, itemStyle:{color:C.crit}},
+  ].filter(d=>d.value>0);
+  CHARTS.chartFleet.setOption({
+    tooltip:{trigger:'item', backgroundColor:'#232320', borderColor:C.line, textStyle:{color:C.ink}},
+    legend:{bottom:0, textStyle:{color:C.ink2, fontSize:12}, icon:'circle', itemWidth:8},
+    series:[{type:'pie', radius:['58%','82%'], center:['50%','44%'],
+      itemStyle:{borderColor:'#1a1a19', borderWidth:2, borderRadius:4},
+      label:{show:true, position:'center', formatter:()=>`{v|${o.total}}\n{l|实例}`,
+        rich:{v:{fontSize:30,fontWeight:700,color:C.ink}, l:{fontSize:12,color:C.ink3}}},
+      emphasis:{scale:false}, data}]});
+}
+function renderNodes(nodes) {
+  const names = nodes.map(n=>`${n.name}${n.gvisor?' ⬡':''}`);
+  const mk = (used, alloc, color, name) => [
+    {name:`${name}用量`, type:'bar', stack:name, barWidth:9, data:used,
+     itemStyle:{color, borderRadius:[0,4,4,0]}},
+    {name:`${name}余量`, type:'bar', stack:name, barWidth:9,
+     data:alloc.map((a,i)=>Math.max(a-used[i],0)),
+     itemStyle:{color:'#2a2a27', borderRadius:[0,4,4,0]}, tooltip:{show:false}}];
+  CHARTS.chartNodes.setOption({
+    tooltip:{trigger:'axis', axisPointer:{type:'shadow'}, backgroundColor:'#232320',
+      borderColor:C.line, textStyle:{color:C.ink},
+      formatter: ps => { const i=ps[0].dataIndex, n=nodes[i];
+        return `<b>${n.fullName}</b><br>${n.machine}${n.gvisor?' · gVisor':''}<br>`+
+        `CPU ${n.usedCpu} / ${n.allocCpu} 核<br>内存 ${n.usedMemGi} / ${n.allocMemGi} Gi`; }},
+    legend:{show:true, top:0, textStyle:{color:C.ink2,fontSize:11}, data:['CPU用量','内存用量']},
+    grid:{left:6, right:14, top:26, bottom:2, containLabel:true},
+    xAxis:{type:'value', axisLabel:{color:C.ink3,fontSize:10}, splitLine:{lineStyle:{color:C.line}}},
+    yAxis:{type:'category', data:names, axisLabel:{color:C.ink2,fontSize:11}, axisLine:{show:false}, axisTick:{show:false}},
+    series:[...mk(nodes.map(n=>n.usedCpu), nodes.map(n=>n.allocCpu), C.cpu, 'CPU'),
+            ...mk(nodes.map(n=>n.usedMemGi), nodes.map(n=>n.allocMemGi), C.mem, '内存')]});
+}
+function renderTrend(items) {
+  CHARTS.chartTrend.setOption({
+    tooltip:{trigger:'axis', backgroundColor:'#232320', borderColor:C.line, textStyle:{color:C.ink}},
+    legend:{top:0, textStyle:{color:C.ink2,fontSize:11}},
+    grid:{left:6,right:14,top:28,bottom:2,containLabel:true},
+    xAxis:{type:'category', data:items.map(i=>i.ts), axisLabel:{color:C.ink3,fontSize:10},
+      axisLine:{lineStyle:{color:C.line}}},
+    yAxis:[{type:'value', name:'vCPU', nameTextStyle:{color:C.ink3},
+      axisLabel:{color:C.ink3,fontSize:10}, splitLine:{lineStyle:{color:C.line}}}],
+    series:[
+      {name:'沙箱 CPU 用量', type:'line', smooth:true, showSymbol:false, lineStyle:{width:2,color:C.cpu},
+       areaStyle:{color:'#3987e522'}, data:items.map(i=>i.sandboxCpu)},
+      {name:'节点 CPU 用量', type:'line', smooth:true, showSymbol:false,
+       lineStyle:{width:2,color:C.aqua}, data:items.map(i=>i.nodeCpuUsed)},
+    ]});
+}
+function renderAudit(items) {
+  $('auditRows').innerHTML = items.slice(0,12).map(e =>
+    `<tr><td class="addr">${e.ts}</td><td>${e.actor}${e.role==='admin'?' <span class="hint">(管理员)</span>':''}</td>
+     <td>${e.action}</td><td class="addr">${e.target||'-'}</td><td class="hint">${e.detail||''}</td></tr>`).join('')
+    || '<tr><td colspan="5" class="hint">暂无记录</td></tr>';
+}
+
+/* ---------- 详情抽屉 ---------- */
+function closeDrawer(){ $('drawer').classList.remove('open'); }
+function meter(v, max, color){ const p=Math.min(100, max?100*v/max:0);
+  return `<div class="meter"><i style="width:${p.toFixed(1)}%;background:${color}"></i></div>`; }
+async function openDetail(emp) {
+  try {
+    window._LAST_EMP = emp;
+    const d = await api(`/api/instances/${emp}/detail`);
+    $('dTitle').textContent = `工号 ${emp}`;
+    const u = d.usage || {}, req = (d.pod||{}).requests || {};
+    const st = d.storageTelemetry || {};
+    const isT2 = st.tier === 'pro-hyperdisk';
+    const reqCpu = parseFloat(req.cpu||'0')/(String(req.cpu||'').endsWith('m')?1000:1) || 0.5;
+    const reqMem = parseFloat(req.memory||'2');
+    const p95Col = st.sqliteTxP95Ms > 15 ? C.crit : (st.sqliteTxP95Ms > 10 ? C.warn : C.good);
+    const lagCol = st.eventLoopLagP99Ms > 1000 ? C.crit : (st.eventLoopLagP99Ms > 250 ? C.warn : C.good);
+    const scanCol = st.sessionLocksScanMs > 200 ? C.crit : (st.sessionLocksScanMs > 50 ? C.warn : C.good);
+    const acctCol = (st.feishuAccounts >= 13 && !isT2) ? C.crit : ((st.feishuAccounts >= 9 && !isT2) ? C.warn : C.good);
+    $('dBody').innerHTML = `
+      <div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap">
+        <span class="state ${d.operatingMode==='Suspended'?'已休眠':(d.pod?'运行中':'启动中')}">${d.operatingMode==='Suspended'?'已休眠':(d.pod?'运行中':'未运行')}</span>
+        <span class="tier-badge ${isT2?'t2':'t1'}">${st.tierLabel || 'Tier 1 · Filestore'}</span>
+      </div>
+      <div class="kv">
+        <span class="k">认领对象</span><span class="val addr">${d.claim}</span>
+        <span class="k">实例</span><span class="val addr">${d.sandbox||'-'}</span>
+        <span class="k">开通时间</span><span class="val">${(d.createdAt||'').replace('T',' ').slice(0,19)}</span>
+        <span class="k">StorageClass</span><span class="val addr">${st.storageClass||'-'}</span>
+        <span class="k">SQLite 模式</span><span class="val addr">${st.pragmaMode||'-'}</span>
+        <span class="k">Doctor 迁移</span><span class="val addr">${st.doctorFixMode||'initContainer + emptyDir'}</span>
+        ${d.pod?`
+        <span class="k">所在节点</span><span class="val addr">${d.pod.node}</span>
+        <span class="k">Pod IP</span><span class="val addr">${d.pod.ip}</span>
+        <span class="k">本次启动</span><span class="val">${d.pod.startedAt.slice(0,19)} · 重启 ${d.pod.restarts} 次</span>
+        <span class="k">镜像</span><span class="val addr">${d.pod.image}</span>`:''}
+      </div>
+
+      <h3 style="margin-top:14px">📊 存储层与 SQLite 实时监控 <span class="hint">（${st.probeSource||'实时遥测'} · ${st.lastProbedAt||''}）</span></h3>
+      ${(d.operatingMode === 'Suspended' || st.instanceState === '已休眠' || st.sqliteTxP95Ms == null) ? `
+      <div style="border:1px solid var(--line);background:#151514;border-radius:10px;padding:12px">
+        <div style="font-size:12.5px;color:var(--ink2);line-height:1.6">
+          💤 <b>当前实例处于「已休眠」状态</b>：沙箱 Pod 与 Node.js Gateway 进程已释放（计算费用归零），内存状态已固化在 PodSnapshot，持久化工作目录保留在 <b>${st.tierLabel}</b>。<br>
+          <span class="hint">休眠期间无活跃 SQLite 读写事务与 EventLoop 滞后指标；唤醒实例恢复运行后将自动恢复实时采集。</span>
+        </div>
+        <div style="display:flex;gap:8px;margin-top:10px">
+          <button class="primary" onclick="act('${emp}','wake','唤醒');closeDrawer()">☀️ 唤醒此实例（恢复运行与实时监控）</button>
+        </div>
+      </div>` : `
+      <div style="border:1px solid ${st.recommendUpgrade?'#d03b3b88':'var(--line)'};background:${st.recommendUpgrade?'#d03b3b18':'#151514'};border-radius:10px;padding:12px">
+        <div style="font-size:12px;color:var(--ink2);display:flex;justify-content:space-between">
+          <span>① SQLite 写事务 P95 (<code>sqlite_write_tx_p95_ms</code>)</span>
+          <b style="color:${p95Col}">${st.sqliteTxP95Ms} ms / 阈值 15.0 ms (TPS: ${st.sqliteTps})</b>
+        </div>
+        ${meter(st.sqliteTxP95Ms||0, 25, p95Col)}
+
+        <div style="font-size:12px;color:var(--ink2);display:flex;justify-content:space-between">
+          <span>② EventLoop 阻塞滞后 (<code>nodejs_eventloop_lag_p99_ms</code>)</span>
+          <b style="color:${lagCol}">${st.eventLoopLagP99Ms} ms / 阈值 1000 ms</b>
+        </div>
+        ${meter(st.eventLoopLagP99Ms||0, 1500, lagCol)}
+
+        <div style="font-size:12px;color:var(--ink2);display:flex;justify-content:space-between">
+          <span>③ 会话锁目录扫描 (<code>session_locks_scan_ms</code>)</span>
+          <b style="color:${scanCol}">${st.sessionLocksScanMs} ms / 阈值 200 ms</b>
+        </div>
+        ${meter(st.sessionLocksScanMs||0, 300, scanCol)}
+
+        <div style="font-size:12px;color:var(--ink2);display:flex;justify-content:space-between;align-items:center">
+          <span>④ 挂载飞书通道数 (<code>bound_feishu_accounts</code>)</span>
+          <b style="color:${acctCol}">${st.feishuAccounts||1} 个（1~8绿 · 9~12黄 · ≥13红触发升配）</b>
+        </div>
+        ${meter(st.feishuAccounts||1, 17, acctCol)}
+        <div style="display:flex;align-items:center;flex-wrap:wrap;gap:5px;margin:4px 0 8px">
+          <span class="hint">增减飞书通道：</span>
+          <button onclick="adjustFeishu('${emp}',null,-1)">−1 通道</button>
+          <button onclick="adjustFeishu('${emp}',null,1)">+1 通道</button>
+          <button onclick="adjustFeishu('${emp}',3,null)">3通道(🟢常规)</button>
+          <button onclick="adjustFeishu('${emp}',8,null)">8通道(🟢健康上限)</button>
+          <button onclick="adjustFeishu('${emp}',10,null)">10通道(🟡预警)</button>
+          <button onclick="adjustFeishu('${emp}',13,null)">13通道(🔴触发升配)</button>
+          <button onclick="adjustFeishu('${emp}',17,null)">17通道(🔴极限)</button>
+        </div>
+
+        ${(st.triggers && st.triggers.length) ? `
+          <div style="margin-top:8px;padding:8px 10px;border-radius:6px;background:#d03b3b28;color:#ff8080;font-size:12px">
+            <b>🚨 已触发自动升配硬阈值（建议立即升配至 Tier 2 · Hyperdisk SSD）：</b>
+            <ul style="margin:4px 0 0 18px;padding:0">${st.triggers.map(t=>`<li>${t}</li>`).join('')}</ul>
+          </div>` : (st.health === 'warn' ? `
+          <div style="margin-top:6px;padding:7px 10px;border-radius:6px;background:#fab21922;color:var(--warn);font-size:12px">
+            🟡 <b>临界预警（${st.feishuAccounts} 飞书通道）</b>：多群汇流高峰期偶发 3~4 通道同秒并发写锁排队（SQLite P95 = ${st.sqliteTxP95Ms}ms，EventLoop Lag = ${st.eventLoopLagP99Ms}ms），当通道数 ≥13 时将触发升配块存储红线。
+          </div>` : `
+          <div style="margin-top:6px;color:#4be34b;font-size:12px">
+            🟢 当前存储 I/O 与 SQLite 事务延迟处于健康区间（1~8 通道日常错峰，同秒活跃 ≤2 通道，真落盘 fsync P50 = ${st.create1kFsyncP50Ms||1.544} ms/file）
+          </div>`)}
+
+        <div style="display:flex;flex-wrap:wrap;gap:6px;margin-top:10px">
+          <button onclick="probeStorage('${emp}','live_exec')">🔍 实测探针采样</button>
+          <button onclick="probeStorage('${emp}','stress_17_accounts')">🔥 模拟 17 飞书账号压测</button>
+          <button onclick="probeStorage('${emp}','baseline')">↩ 恢复日常轻载</button>
+          ${!isT2
+            ? `<button class="upgrade-btn" onclick="upgradeStorage('${emp}','pro-hyperdisk')">⚡ 一键热升配至 Hyperdisk SSD (~1.77s)</button>`
+            : `<button onclick="upgradeStorage('${emp}','standard-filestore')">↩ 切回 Tier 1 Filestore (复演用)</button>`}
+        </div>
+      </div>`}
+
+      ${d.pod?`<h3 style="margin-top:14px">计算资源实时用量 <span class="hint">/ 申报</span></h3>
+      <div style="font-size:12px;color:var(--ink2)">CPU ${u.cpu??'—'} / ${req.cpu||'-'} </div>${meter(u.cpu||0, reqCpu, C.cpu)}
+      <div style="font-size:12px;color:var(--ink2)">内存 ${u.memGi??'—'}Gi / ${req.memory||'-'}</div>${meter(u.memGi||0, reqMem, C.mem)}`:''}
+      <h3 style="margin-top:14px">快照历史</h3>
+      ${(d.snapshots||[]).map(s=>`<div style="font-size:12.5px;color:var(--ink2)">${s.ready?'✓':'⏳'} ${s.createdAt.replace('T',' ').slice(0,19)} <span class="addr">${s.name}</span></div>`).join('') || '<div class="hint">暂无快照</div>'}
+      <h3 style="margin-top:14px">最近事件</h3>
+      ${(d.events||[]).map(e=>`<div style="font-size:12px;margin-bottom:4px">
+        <span class="${e.type==='Warning'?'':'hint'}" style="${e.type==='Warning'?'color:var(--warn)':''}">${e.reason}</span>
+        <span class="hint"> ${e.time.slice(5)}</span><br><span class="hint">${e.message}</span></div>`).join('') || '<div class="hint">无事件</div>'}
+    `;
+    $('drawer').classList.add('open');
+  } catch(e) { toast('详情加载失败: '+e.message, true); }
+}
+async function adjustFeishu(emp, accounts, delta) {
+  try {
+    const body = {mode: 'set_accounts'};
+    if (accounts !== null && accounts !== undefined) body.accounts = accounts;
+    if (delta !== null && delta !== undefined) body.delta = delta;
+    const r = await api(`/api/instances/${emp}/storage/probe`, {method:'POST', body:JSON.stringify(body)});
+    const st = r.storageTelemetry;
+    const badge = st.health === 'crit' ? '🔴 红灯告警' : (st.health === 'warn' ? '🟡 黄灯预警' : '🟢 绿灯健康');
+    toast(`工号 ${emp} 飞书通道 → ${st.feishuAccounts} 个 (${badge} · P95=${st.sqliteTxP95Ms}ms · Lag=${st.eventLoopLagP99Ms}ms)`, st.recommendUpgrade);
+    await refresh(); if (ME.admin) loadAdmin();
+    if ($('drawer').classList.contains('open')) await openDetail(emp);
+  } catch(e) { toast('调整通道数失败: ' + e.message, true); }
+}
+async function probeStorage(emp, mode) {
+  try {
+    const r = await api(`/api/instances/${emp}/storage/probe`, {method:'POST', body:JSON.stringify({mode})});
+    const st = r.storageTelemetry;
+    toast(`工号 ${emp} 探针完成：SQLite P95=${st.sqliteTxP95Ms}ms · EventLoop Lag=${st.eventLoopLagP99Ms}ms (${st.feishuAccounts}通道)`, st.recommendUpgrade);
+    await refresh(); if (ME.admin) loadAdmin();
+    if ($('drawer').classList.contains('open')) await openDetail(emp);
+  } catch(e) { toast('存储探针失败: ' + e.message, true); }
+}
+async function upgradeStorage(emp, targetTier='pro-hyperdisk') {
+  try {
+    const {task} = await api(`/api/instances/${emp}/storage/upgrade`, {method:'POST', body:JSON.stringify({targetTier})});
+    toast(targetTier==='pro-hyperdisk' ? `⚡ 正在将工号 ${emp} 在线热升配至 Tier 2 · Hyperdisk SSD…` : `正在将 ${emp} 切回 Tier 1 · Filestore…`);
+    const timer = setInterval(async () => {
+      const t = await api('/api/tasks/' + task);
+      if (t.state === 'running') return;
+      clearInterval(timer);
+      toast(`${t.detail}`, t.state !== 'done');
+      refresh(); if (ME.admin) loadAdmin();
+      if ($('drawer').classList.contains('open')) openDetail(emp);
+    }, 800);
+  } catch(e) { toast('存储升配失败: ' + e.message, true); }
+}
+
+/* ---------- 操作 ---------- */
+async function createInst() {
+  try {
+    const emp = ME.admin && $('newEmp').value ? $('newEmp').value : ME.employee;
+    const r = await api('/api/instances', {method:'POST', body:JSON.stringify({employee:emp})});
+    toast(r.message || ('已发起领取：' + emp), !r.created); refresh();
+  } catch(e) { toast('创建失败: '+e.message, true); }
+}
+async function del(emp) {
+  if (!confirm(`确认删除 ${emp} 的实例？`)) return;
+  try { await api('/api/instances/'+emp, {method:'DELETE'}); toast('已删除 '+emp); refresh(); }
+  catch(e) { toast('删除失败: '+e.message, true); }
+}
+async function act(emp, action, label) {
+  try {
+    const {task} = await api(`/api/instances/${emp}/${action}`, {method:'POST'});
+    toast(`${label}任务已提交…`);
+    const timer = setInterval(async () => {
+      const t = await api('/api/tasks/'+task);
+      if (t.state === 'running') return;
+      clearInterval(timer);
+      toast(`${label}${t.state==='done'?'完成':'失败'}（${t.elapsed}s）：${t.detail}`, t.state!=='done');
+      refresh(); if (ME.admin) loadAdmin();
+    }, 3000);
+  } catch(e) { toast(`${label}失败: `+e.message, true); }
+}
+async function pair(emp) {
+  try {
+    const r = await api(`/api/instances/${emp}/pairing/approve`, {method:'POST'});
+    toast(r.count ? `已批准 ${r.count} 个配对请求` : '没有待批准的配对请求', !r.count);
+  } catch(e) { toast('配对批准失败: ' + e.message, true); }
+}
+function openUI(emp, url) {
+  document.cookie = `open_emp=${emp}; path=/`;
+  window.open(url, '_blank');
+}
+boot();
+</script>
+</body>
+</html>

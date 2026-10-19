@@ -1,0 +1,137 @@
+# Sandbox Portal 部署清单：SA + 最小 RBAC + Deployment + Service
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: sandbox-portal
+  namespace: default
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: sandbox-portal
+  namespace: default
+rules:
+  - apiGroups: ["extensions.agents.x-k8s.io"]
+    resources: ["sandboxclaims"]
+    verbs: ["get", "list", "watch", "create", "delete"]
+  - apiGroups: ["extensions.agents.x-k8s.io"]
+    resources: ["sandboxwarmpools"]          # 概览:热池水位;管理员可调池深
+    verbs: ["get", "list", "watch", "patch"]
+  - apiGroups: ["agents.x-k8s.io"]
+    resources: ["sandboxes"]
+    verbs: ["get", "list", "watch", "patch", "create", "delete"]  # 个人盘模式:直建/删除 Sandbox
+  - apiGroups: ["podsnapshot.gke.io"]
+    resources: ["podsnapshotmanualtriggers", "podsnapshots"]
+    verbs: ["get", "list", "watch", "create", "delete"]
+  - apiGroups: [""]
+    resources: ["pods", "events"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: [""]
+    resources: ["pods/exec"]        # 配对批准:在沙箱内执行 devices approve
+    verbs: ["get", "create"]        # websocket 形态的 exec 走 GET,两个动词都要
+  - apiGroups: [""]
+    resources: ["persistentvolumeclaims"]   # 概览:容量汇总;个人盘模式:预建工号静态盘
+    verbs: ["get", "list", "create"]
+  - apiGroups: [""]
+    resources: ["configmaps"]               # 计时账本(portal-timings)
+    verbs: ["get", "list", "create", "patch"]
+  - apiGroups: ["extensions.agents.x-k8s.io"]
+    resources: ["sandboxtemplates"]         # 剧本④:模板版本演练
+    verbs: ["get", "list", "patch"]
+  - apiGroups: ["autoscaling.x-k8s.io"]
+    resources: ["capacitybuffers"]          # 混合容量分层概览;管理员可调 Standby 容量
+    verbs: ["get", "list", "patch"]
+  - apiGroups: [""]
+    resources: ["services"]
+    verbs: ["get", "list", "create", "delete"]
+  - apiGroups: ["gateway.networking.k8s.io"]
+    resources: ["httproutes"]
+    verbs: ["get", "list", "create", "delete"]
+---
+# 集群级只读:节点与 metrics-server 用量(门户内监控)
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: sandbox-portal-cluster-read
+rules:
+  - apiGroups: [""]
+    resources: ["nodes"]
+    verbs: ["get", "list"]
+  - apiGroups: ["metrics.k8s.io"]
+    resources: ["nodes", "pods"]
+    verbs: ["get", "list"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: sandbox-portal-cluster-read
+subjects:
+  - kind: ServiceAccount
+    name: sandbox-portal
+    namespace: default
+  - kind: User
+    name: sandbox-portal-cr@${PROJECT_ID}.iam.gserviceaccount.com
+  - kind: User
+    name: "104003478309728488434"     # 同一 SA 的数字唯一 ID(GKE 实际呈现的用户名)
+roleRef:
+  kind: ClusterRole
+  name: sandbox-portal-cluster-read
+  apiGroup: rbac.authorization.k8s.io
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: sandbox-portal
+  namespace: default
+subjects:
+  - kind: ServiceAccount
+    name: sandbox-portal
+    namespace: default
+roleRef:
+  kind: Role
+  name: sandbox-portal
+  apiGroup: rbac.authorization.k8s.io
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: sandbox-portal
+  namespace: default
+  labels: { app: sandbox-portal-web }
+spec:
+  replicas: 1
+  selector:
+    matchLabels: { app: sandbox-portal-web }
+  template:
+    metadata:
+      labels: { app: sandbox-portal-web }
+    spec:
+      serviceAccountName: sandbox-portal
+      containers:
+        - name: portal
+          image: ${PORTAL_IMAGE}
+          ports: [{ containerPort: 8080 }]
+          env:
+            - { name: NAMESPACE, value: "default" }
+            - { name: POOL, value: "openclaw-pool" }
+            - name: PORTAL_PASSWORD                      # 统一访问密码;生产接 IAP 后可置空禁用
+              valueFrom:
+                secretKeyRef: { name: portal-auth, key: password }
+            - { name: ADMIN_EMPLOYEES, value: "admin" }
+            # - { name: GATEWAY_BASE_URL, value: "https://<公网域名>" }  # 配好 Gateway+router 后启用"打开"按钮
+          readinessProbe:
+            httpGet: { path: /healthz, port: 8080 }
+          resources:
+            requests: { cpu: 100m, memory: 128Mi }
+            limits: { cpu: "1", memory: 512Mi }
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: sandbox-portal
+  namespace: default
+spec:
+  selector: { app: sandbox-portal-web }
+  ports:
+    - { name: web, port: 80, targetPort: 8080 }
+    - { name: ui-proxy, port: 8081, targetPort: 8081 }
