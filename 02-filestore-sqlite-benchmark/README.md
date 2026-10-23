@@ -8,9 +8,9 @@
 
 如果您**已经部署好了 GKE 集群、VPC 和子网**（并且项目已完成 Filestore Agent Volumes 开白，甚至已经创建了 PSC Service Connection Policy），**不需要从头建集群**！
 
-### 方式 A：直接运行幂等脚本（自动跳过已存在的 VPC / GKE / PSC）
-`03-setup-agent-volumes.sh` 已内置全量存在性检测，会自动跳过 `Step 2~4` 的集群新建操作，直接为您完成：
-1. **关闭 GKE 内置的旧版 `GcpFilestoreCsiDriver` 插件**（避免与支持 `volume-pool` 的驱动冲突）；
+### 方式 A：直接运行专为「已有 GKE 集群」精简的极简脚本 `03b-setup-agent-volumes-existing-gke.sh`（推荐）
+我们已为您将冗余的创建 VPC、子网、新建 GKE 集群的命令全部剔除，整理为精简脚本 **`03b-setup-agent-volumes-existing-gke.sh`**（直接从原 `Step 3` 开始，若集群名填错只会给出提示并安全退出，绝不会误建新集群）：
+1. **检查现有 GKE 集群并关闭冲突的内置 `GcpFilestoreCsiDriver` 插件**；
 2. **复用已有的 PSC `service-connection-policies`**（若尚未创建则自动创建）；
 3. **调用 REST API 创建「单实例 × 1 TiB」省配额版 `VolumePool`**（节省 95% 容量配额与成本）；
 4. **部署支持 `volumepool` 的 CSI 驱动，并创建带 14 项 NFS 极限性能调优参数（`nocto, local_lock=all, actimeo=600, nconnect=8, async` 等）的 `StorageClass` (`volume-pool-sc` / `volume-pool-1tb-tuned-sc`)**。
@@ -24,7 +24,7 @@ export CLUSTER="your-existing-gke-cluster"       # 现有 GKE 集群名称
 export VPC_NETWORK="your-existing-vpc"           # 现有 VPC 名称
 export SUBNET_NAME="your-existing-subnet"        # 现有子网名称
 
-bash ./03-setup-agent-volumes.sh
+bash ./03b-setup-agent-volumes-existing-gke.sh
 ```
 
 ### 方式 B：如果您想手动分步执行（仅执行已有 GKE 集群缺失的 3 步）
@@ -36,7 +36,8 @@ bash ./03-setup-agent-volumes.sh
 
 | 文件名 | 用途说明 |
 | :--- | :--- |
-| **`03-setup-agent-volumes.sh`** | **【首选】初始化开白后的 Filestore Agent Volumes (`VolumePool`) + 1TiB 单实例省钱配置 + 14 项 NFS 调优 `StorageClass`**（自动复用已有 GKE 集群）。 |
+| **`03b-setup-agent-volumes-existing-gke.sh`** | **【首选 · 已有 GKE 集群极简版】直接从原 Step 3 开始（剔除新建 VPC/子网/GKE 集群冗余代码），一键完成内置插件关闭、1TiB VolumePool 创建与 14 项调优 `StorageClass` 部署**。 |
+| `03-setup-agent-volumes.sh` | （从零新建环境完整版）包含从新建 VPC/子网/GKE 集群到初始化 VolumePool 的全套流程。 |
 | **`04-test-agent-volumes-suite.sh`** | 验证 `VolumePool` 秒级建卷风暴 (`t1`)、沙箱复挂 (`t2`)、WarmPool 认领 (`t3`)、动态晚绑定 (`t4`) 与裸 I/O (`t5`) 的自动化测试套件。 |
 | **`node-sqlite-benchmark.js`** | **【核心推荐】单文件零依赖 SQLite 1,000 次真实事务压测脚本**：直接对比同一个挂载目录上「默认配置」vs「开启 `TRUNCATE + EXCLUSIVE + NORMAL` 独占锁调优」的 P50/P95 延迟与 5 并发/17 并发主线程排队耗时。 |
 | **`sqlite-pragma-preload.cjs`** | **零代码侵入 SQLite 调优预加载钩子**：通过 `NODE_OPTIONS="--require .../sqlite-pragma-preload.cjs"` 自动为 OpenClaw 注入最优 `PRAGMA`。 |

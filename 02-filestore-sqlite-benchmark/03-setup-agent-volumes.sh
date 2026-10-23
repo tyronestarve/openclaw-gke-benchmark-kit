@@ -112,17 +112,9 @@ if gcloud container clusters describe "$CLUSTER" --location="$CLUSTER_LOCATION" 
     echo "  -> 内置 GcpFilestoreCsiDriver 已处于关闭状态，无需变更。"
   fi
 else
-  echo "  -> 未找到现有集群 $CLUSTER，开始创建新集群..."
-  gcloud container clusters create "$CLUSTER" \
-    --project="$PROJECT_ID" \
-    --location="$CLUSTER_LOCATION" \
-    --release-channel=rapid \
-    --network="$VPC_NETWORK" \
-    --subnetwork="$SUBNET_NAME" \
-    --ip-alias \
-    --num-nodes=1 \
-    --machine-type=e2-standard-4 \
-    --workload-pool="${PROJECT_ID}.svc.id.goog"
+  echo "❌ 错误：在项目 $PROJECT_ID ($CLUSTER_LOCATION) 中未找到 GKE 集群 '$CLUSTER'！"
+  echo "   请确认环境变量 CLUSTER 与 CLUSTER_LOCATION 是否填写正确（或先创建好 GKE 集群后再运行本脚本）。"
+  exit 1
 fi
 
 gcloud container clusters get-credentials "$CLUSTER" --location="$CLUSTER_LOCATION" --project="$PROJECT_ID"
