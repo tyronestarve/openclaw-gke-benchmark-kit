@@ -108,6 +108,7 @@ gcloud iam service-accounts add-iam-policy-binding "$CSI_GSA_EMAIL" \
   --member="serviceAccount:${PROJECT_ID}.svc.id.goog[gcp-filestore-csi-driver/gcp-filestore-csi-controller-sa]" \
   --project="$PROJECT_ID"
 
+rm -rf /tmp/gcp-filestore-csi-driver
 git clone --depth=1 https://github.com/kubernetes-sigs/gcp-filestore-csi-driver.git /tmp/gcp-filestore-csi-driver
 kubectl apply -k /tmp/gcp-filestore-csi-driver/deploy/kubernetes/overlays/volumepool
 rm -rf /tmp/gcp-filestore-csi-driver
@@ -116,6 +117,11 @@ kubectl annotate serviceaccount gcp-filestore-csi-controller-sa \
   --namespace=gcp-filestore-csi-driver \
   --overwrite \
   "iam.gke.io/gcp-service-account=${CSI_GSA_EMAIL}"
+
+# 重启 Controller 使 Workload Identity 注解生效，并修复 Node 插件 rpcbind 权限
+kubectl rollout restart statefulset/gcp-filestore-csi-controller -n gcp-filestore-csi-driver
+kubectl patch daemonset gcp-filestore-csi-node -n gcp-filestore-csi-driver --type='json' \
+  -p='[{"op":"add","path":"/spec/template/spec/containers/1/lifecycle","value":{"postStart":{"exec":{"command":["/bin/sh","-c","mkdir -p /run/rpcbind && chown _rpc:root /run/rpcbind && chmod 755 /run/rpcbind && service rpcbind start && rpc.statd || true"]}}}}]'
 
 kubectl rollout status statefulset/gcp-filestore-csi-controller -n gcp-filestore-csi-driver --timeout=180s
 kubectl rollout status daemonset/gcp-filestore-csi-node -n gcp-filestore-csi-driver --timeout=180s
