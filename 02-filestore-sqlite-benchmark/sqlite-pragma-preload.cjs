@@ -6,20 +6,21 @@
  *   and set environment variable on the Pod/SandboxTemplate:
  *     NODE_OPTIONS="--require /etc/openclaw/sqlite-pragma-preload.cjs"
  *
- *   Optional environment variable:
- *     OPENCLAW_SQLITE_MODE="mode3"   # Default: "mode3" (WAL + NORMAL + NORMAL)
- *                                    # Set to "mode2" for (TRUNCATE + EXCLUSIVE + NORMAL)
+ *   Default Recommended Mode:
+ *     WAL + EXCLUSIVE + NORMAL (Zero `-shm` file on NFS; `wal-index` kept in process heap memory)
+ *     IMPORTANT: `PRAGMA locking_mode=EXCLUSIVE;` MUST be executed BEFORE `PRAGMA journal_mode=WAL;`
+ *     so SQLite enters WAL mode with exclusive locking and never creates a `-shm` shared-memory file on NFS.
  */
 'use strict';
 
 try {
   const sqlite = require('node:sqlite');
   const OrigDatabaseSync = sqlite.DatabaseSync;
-  const mode = (process.env.OPENCLAW_SQLITE_MODE || process.env.OPENCLAW_STORAGE_TIER || 'mode3').toLowerCase();
+  const mode = (process.env.OPENCLAW_SQLITE_MODE || process.env.OPENCLAW_STORAGE_TIER || 'wal_exclusive').toLowerCase();
 
   const pragmas = (mode === 'mode2' || mode === '2' || mode === 'truncate')
-    ? 'PRAGMA journal_mode=TRUNCATE; PRAGMA locking_mode=EXCLUSIVE; PRAGMA synchronous=NORMAL; PRAGMA temp_store=MEMORY; PRAGMA busy_timeout=5000;'
-    : 'PRAGMA journal_mode=WAL; PRAGMA locking_mode=NORMAL; PRAGMA synchronous=NORMAL; PRAGMA temp_store=MEMORY; PRAGMA busy_timeout=5000;';
+    ? 'PRAGMA locking_mode=EXCLUSIVE; PRAGMA journal_mode=TRUNCATE; PRAGMA synchronous=NORMAL; PRAGMA temp_store=MEMORY; PRAGMA cache_size=-65536; PRAGMA busy_timeout=5000;'
+    : 'PRAGMA locking_mode=EXCLUSIVE; PRAGMA journal_mode=WAL; PRAGMA synchronous=NORMAL; PRAGMA temp_store=MEMORY; PRAGMA cache_size=-65536; PRAGMA busy_timeout=5000;';
 
   function PatchedDatabaseSync(...args) {
     const db = new OrigDatabaseSync(...args);

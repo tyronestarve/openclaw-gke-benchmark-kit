@@ -171,9 +171,15 @@ runSqliteBenchmark(
 );
 
 runSqliteBenchmark(
-  '3. Mode-3 High-Performance WAL Mode (WAL + NORMAL + NORMAL)',
-  'tuned-wal',
-  'PRAGMA journal_mode=WAL; PRAGMA locking_mode=NORMAL; PRAGMA synchronous=NORMAL;'
+  '3. Step-2 WAL + NORMAL (with -shm file)',
+  'tuned-wal-normal',
+  'PRAGMA journal_mode=WAL; PRAGMA locking_mode=NORMAL; PRAGMA synchronous=NORMAL; PRAGMA busy_timeout=5000;'
+);
+
+runSqliteBenchmark(
+  '4. Final Recommended: WAL + EXCLUSIVE + NORMAL (Zero -shm, Heap wal-index)',
+  'tuned-wal-exclusive',
+  'PRAGMA locking_mode=EXCLUSIVE; PRAGMA journal_mode=WAL; PRAGMA synchronous=NORMAL; PRAGMA temp_store=MEMORY; PRAGMA cache_size=-65536; PRAGMA busy_timeout=5000;'
 );
 
 try {
