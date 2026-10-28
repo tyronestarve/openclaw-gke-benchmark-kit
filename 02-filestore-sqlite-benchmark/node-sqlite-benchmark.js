@@ -171,7 +171,7 @@ runSqliteBenchmark(
 );
 
 runSqliteBenchmark(
-  '3. Step-2 Pro Tier for Hyperdisk Block SSD (WAL + NORMAL)',
+  '3. Mode-3 High-Performance WAL Mode (WAL + NORMAL + NORMAL)',
   'tuned-wal',
   'PRAGMA journal_mode=WAL; PRAGMA locking_mode=NORMAL; PRAGMA synchronous=NORMAL;'
 );

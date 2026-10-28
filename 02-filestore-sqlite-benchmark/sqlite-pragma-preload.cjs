@@ -7,7 +7,7 @@
  *     NODE_OPTIONS="--require /etc/openclaw/sqlite-pragma-preload.cjs"
  *
  *   Optional environment variable:
- *     OPENCLAW_SQLITE_MODE="mode3"   # Default: "mode3" (WAL + EXCLUSIVE + NORMAL)
+ *     OPENCLAW_SQLITE_MODE="mode3"   # Default: "mode3" (WAL + NORMAL + NORMAL)
  *                                    # Set to "mode2" for (TRUNCATE + EXCLUSIVE + NORMAL)
  */
 'use strict';
@@ -19,7 +19,7 @@ try {
 
   const pragmas = (mode === 'mode2' || mode === '2' || mode === 'truncate')
     ? 'PRAGMA journal_mode=TRUNCATE; PRAGMA locking_mode=EXCLUSIVE; PRAGMA synchronous=NORMAL; PRAGMA temp_store=MEMORY; PRAGMA busy_timeout=5000;'
-    : 'PRAGMA journal_mode=WAL; PRAGMA locking_mode=EXCLUSIVE; PRAGMA synchronous=NORMAL; PRAGMA temp_store=MEMORY; PRAGMA busy_timeout=5000;';
+    : 'PRAGMA journal_mode=WAL; PRAGMA locking_mode=NORMAL; PRAGMA synchronous=NORMAL; PRAGMA temp_store=MEMORY; PRAGMA busy_timeout=5000;';
 
   function PatchedDatabaseSync(...args) {
     const db = new OrigDatabaseSync(...args);
