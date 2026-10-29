@@ -20,6 +20,10 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+LATEBIND_YAML="${SCRIPT_DIR}/latebind-example/17-latebind-agent-volumes.yaml"
+if [ ! -f "$LATEBIND_YAML" ]; then
+  LATEBIND_YAML="${SCRIPT_DIR}/17-latebind-agent-volumes.yaml"
+fi
 SC=${SC:-volume-pool-sc}
 NS=${NAMESPACE:-default}
 PVC_SIZE=${PVC_SIZE:-1Gi}   # 与 VolumePool 的 defaultVolumeQuotaMib (1024 MiB = 1Gi) 严格对齐
@@ -388,7 +392,7 @@ run_t4() {
   echo "=================================================================="
   echo "[T4] 形态三：动态存储晚绑定 (bind_nfs Late-bind) + 单用户配额硬隔离"
   echo "=================================================================="
-  kubectl apply -f "${SCRIPT_DIR}/17-latebind-agent-volumes.yaml" >/dev/null
+  kubectl apply -f "${LATEBIND_YAML}" >/dev/null
   kubectl rollout status ds/storage-node-daemon -n "$NS" --timeout=180s >/dev/null
   until [ "$(kubectl get sandboxwarmpool agent-latebind-av-pool -n "$NS" -o jsonpath='{.status.readyReplicas}' 2>/dev/null)" = "2" ]; do
     sleep 1
@@ -466,7 +470,7 @@ print('  ->', urllib.request.urlopen(req).read().decode())
   kubectl patch sandboxclaim latebind-claim-101 -n "$NS" --type=merge -p '{"metadata":{"finalizers":[]}}' >/dev/null || true
   kubectl patch pod "$POD_NAME" -n "$NS" --type=merge -p '{"metadata":{"finalizers":[]}}' >/dev/null || true
   kubectl delete pvc latebind-user101-pvc -n "$NS" --ignore-not-found >/dev/null
-  kubectl delete -f "${SCRIPT_DIR}/17-latebind-agent-volumes.yaml" --ignore-not-found >/dev/null
+  kubectl delete -f "${LATEBIND_YAML}" --ignore-not-found >/dev/null
 }
 
 # ------------------------------------------------------------------------------
@@ -599,7 +603,7 @@ PYEOF
 run_cleanup() {
   echo "正在清理所有 Filestore Agent Volumes 测试资源..."
   kubectl delete sandboxclaim,sandboxwarmpool,sandboxtemplate,sandbox,pod,pvc -n "$NS" -l test-suite=agent-volumes --ignore-not-found >/dev/null 2>&1 || true
-  kubectl delete -f "${SCRIPT_DIR}/17-latebind-agent-volumes.yaml" --ignore-not-found >/dev/null 2>&1 || true
+  kubectl delete -f "${LATEBIND_YAML}" --ignore-not-found >/dev/null 2>&1 || true
   echo "✅ 清理完成。"
 }
 

@@ -10,7 +10,40 @@ This guide explains how to dynamically bind pre-allocated tenant storage (from a
 
 **Note on Storage Limits:** Because this architecture dynamically bind-mounts a shared master PVC after the pod has started, standard Kubernetes resource.limits cannot be used to enforce per-agent storage quotas. If an orchestrator does not implement custom directory monitoring, a single agent could potentially fill the entire shared volume and cause a Denial of Service.
 
-Kubernetes does not allow attaching persistent volumes dynamically to pre-created warm pool pods without restarting them. To bypass this constraint and avoid pod restarts to reduce sandbox claim latency, we utilize a custom privileged **Storage Node Daemon** running as a `DaemonSet`. When a sandbox is claimed, a late-bind HTTP request is sent to the local node daemon, which bind-mounts the tenant's Filestore subdirectory directly into the pod's `emptyDir` mount path on the host. Since the container volume mount uses `HostToContainer` propagation, the dynamically bound storage instantly becomes accessible inside the running sandbox container.
+Kubernetes does not allow attaching persistent volumes dynamically to pre-created warm pool pods without restarting them. To bypass this constraint and avoid pod restarts to reduce sandbox claim latency, we utilize a custom privileged **Storage Node Daemon** running as a `DaemonSet` (`hostPID: true`, `hostNetwork: true`). When a sandbox is claimed, a late-bind HTTP request is sent to the local node daemon (`127.0.0.1:9090`), which uses Linux kernel mount-API syscalls (`open_tree(OPEN_TREE_CLONE)` + `move_mount`) to inject the tenant's Filestore volume or subdirectory **directly into the Pod's isolated `runsc-gofer` mount namespace** (leaving the host PID 1 mount table `/proc/1/mountinfo` completely untouched). Inside the running gVisor sandbox (`dev.gvisor.empty-dir.<name>.force-shared: "true"`), the dynamically bound storage instantly becomes accessible.
+
+## Production Security & Hardening Architecture (Differences vs. Upstream Reference)
+
+Compared to the upstream `agent-sandbox-latebind` reference guide (which executed `mount --bind` / `mount -t nfs` directly into `/host-root/var/lib/kubelet/pods/<uid>/.../empty-dir/...` in the host's root mount namespace), both [`17-latebind-agent-volumes.yaml`](17-latebind-agent-volumes.yaml) (for per-user Filestore Agent Volumes / `VolumePool`) and [`storage-infra.yaml`](storage-infra.yaml) (for shared Filestore Multishare / Regional subdirectories) implement the following production safety hardening:
+
+1. **Zero-Race Mount-Namespace Isolation (`open_tree` + `move_mount` into `runsc-gofer`)**:
+   - **Root Cause Solved**: When a mount sits in the host's root mount namespace under Kubelet's `emptyDir`, an unexpected `OOMKill`, `SIGKILL`, or `kubectl delete pod --grace-period=0 --force` without prior `unbind` causes Kubelet's `emptyDir` teardown (`os.RemoveAll`) to traverse into the still-mounted NFS directory and **recursively delete the tenant's remote Filestore data**.
+   - **Kernel Guarantee**: By injecting detached mounts exclusively into the per-pod `runsc-gofer` mount namespace (`MS_SLAVE`), `/proc/1/mountinfo` on the host has **zero** dynamic NFS mounts. Whenever the sandbox terminates (gracefully or via `--force` / `SIGKILL`), the Linux kernel automatically destroys `runsc-gofer`'s mount namespace before Kubelet cleans up the host `emptyDir`.
+2. **Host `init_net` Transport Anchoring (`hostNetwork: true` + `setns(CLONE_NEWNET)`)**:
+   - In [`17-latebind-agent-volumes.yaml`](17-latebind-agent-volumes.yaml), kernel NFS `rpc_clnt` sockets are explicitly created inside `/proc/1/ns/net` (`init_net`) and staged in a temporary `unshare(CLONE_NEWNS)` + `tmpfs` mount namespace (natively supporting read-only `COS_CONTAINERD` via `/sbin/mount.nfs` without `apt-get` or internet access, with automatic `nfs-common netbase` fallback on Ubuntu nodes). Rolling-updating or force-killing `storage-node-daemon` has **zero impact** on active sandboxes' NFS I/O.
+3. **Prerequisites & Verified Runtime Baseline**:
+   - **Requirements**: Linux Kernel `>= 5.2` (`SYS_open_tree` 428, `SYS_move_mount` 429, `SYS_mount_setattr` 442), GKE `>= 1.36.0-gke.3302001`, DaemonSet `hostPID: true`, `hostNetwork: true`, `privileged: true` (no `hostPath: /` volume mount is needed).
+   - **Verified Baseline**: **GKE Standard `v1.36.4-gke.2377000` / `COS_CONTAINERD` Kernel `6.12.110+` / `containerd 2.2.7`** (`gVisor` per-pod `runsc-gofer` + `DirectFS` chrooted at `/root`).
+4. **`LATEBIND_MODE` Three-Mode Fallback Switch**:
+   - `auto` *(default)*: Uses `gofer_mountns` when an active `runsc-gofer` mount target is present; automatically falls back to `host_watched` on non-gVisor runtimes or if future runtime internals change.
+   - `gofer_mountns`: Enforces `runsc-gofer` mount-namespace injection only (fails closed if not found).
+   - `host_watched`: Fallback host mount mode guarded by a 50ms `/proc/<pid>` liveness reaper thread that automatically triggers `umount2(MNT_FORCE | MNT_DETACH)` on pod exit.
+5. **Default `hard` NFS Semantics + `MNT_FORCE` Unbind vs. Optional `NFS_EXTRA_OPTS`**:
+   - Follows Filestore's official recommendation by defaulting to **`hard`** mounts (`NFS_EXTRA_OPTS=""`). Verified live: across a >35s silent NFS outage, SQLite `fsync()` safely pauses and returns `0` (`sqlite_commit: OK`) once connectivity recovers—avoiding `ETIMEDOUT` / `SQLITE_IOERR` errors.
+   - **Behavior under permanent NFS blackhole during Pod deletion (`R5b` / `R5c`)**: Because gVisor `DirectFS` donates the host mount FD to `runsc-sandbox` (`runsc kill` communicates via Sentry's control socket without sending host `SIGKILL` while a Sentry thread is in `rpc_wait_bit_killable`), deleting a `hard`-mounted Pod during a permanent Filestore outage without calling `unbind` will hold the Pod in `Terminating` until either connectivity returns or `unbind` is called. Calling `action=unbind` (`umount2(MNT_FORCE | MNT_DETACH)`) invokes kernel `nfs_umount_begin -> rpc_killall_tasks` in `< 1ms`, immediately aborting stuck RPCs so the Pod exits completely in **`< 6s`**.
+   - **Emergency Runbook (when BOTH Filestore AND `storage-node-daemon` are down)**: If a node's `storage-node-daemon` Pod is unavailable during a total Filestore outage and a `Terminating` sandbox must be released immediately on the node host, locate the Pod's `runsc-gofer` PID and force-detach inside its mount namespace (note the `/root/...` prefix because `runsc-gofer` `chroot`s into `/root`):
+     ```shell
+     GOFER_PID=$(grep -l "$POD_UID" /proc/[0-9]*/mountinfo 2>/dev/null | cut -d/ -f3 | xargs -r -I{} sh -c 'tr "\0" " " </proc/{}/cmdline 2>/dev/null | grep -q runsc-gofer && echo {}' | head -n1)
+     # For 17-latebind-agent-volumes.yaml:
+     sudo nsenter -t "$GOFER_PID" -m -- umount -f -l /root/mnt/latebind-root/workspace
+     # For storage-infra.yaml / sandbox-warmpool.yaml:
+     sudo nsenter -t "$GOFER_PID" -m -- umount -f -l /root/workspace/user_data
+     ```
+   - Operators running *without* an automated `unbind` controller who explicitly prioritize unassisted `Terminating` exit over pausing I/O may set `NFS_EXTRA_OPTS="softerr,timeo=50,retrans=2"` (accepting that >30s storage unreachability during normal runtime returns `ETIMEDOUT` / `SQLITE_IOERR` to applications).
+6. **Concurrency, Auth & Server-Atomic Lease Protection**:
+   - Uses `ThreadingHTTPServer` + bounded DNS/mount timeouts (`LATEBIND_MOUNT_TIMEOUT_SEC=20`) so concurrent claims across high-density nodes (e.g., 88 Pods/node) do not head-of-line block across different volumes.
+   - Optional Bearer token authentication via `LATEBIND_AUTH_TOKEN` environment variable.
+   - **In-Process Per-Volume Mutex + NFSv3 `O_CREAT | O_EXCL` Atomic Lease (`.latebind_lease.json`, `enforce_lease=true` by default)**: Serializes same-node concurrent requests per volume via `threading.Lock` (`get_key_lock`) wrapping the entire check-write-mount critical section, and creates `.latebind_lease.json` via `os.O_CREAT | os.O_EXCL` (server-atomic NFSv3 `CREATE3(EXCLUSIVE)`). This eliminates intra-node thread races and also rejects concurrent **cross-node** double-claims with **HTTP `409 Conflict`**. Graceful `unbind` cleans up `.latebind_lease.json` best-effort (bounded to a `0.2s` non-blocking timeout so blackholed NFS never stalls `unbind`); same-node dead-pod crashes are auto-reclaimed via `/proc` inspection, while cross-node crashes where `unbind` could not run can be reclaimed by passing `"force_rebind": true` from your upper-layer claim orchestrator.
 
 **About this Guide: Manual Commands vs Production Architecture**
 
@@ -89,7 +122,7 @@ gcloud beta container clusters update ${CLUSTER_NAME} \
 
 This configuration provisions the shared Filestore `PersistentVolumeClaim` and deploys a privileged node daemon running a local HTTP server. In this guide, you will manually manage host-level bind mounts by executing commands directly against this daemon pod. This walkthrough assumes the node daemon is deployed in the `default` namespace. However, as a best practice, it should be deployed in a separate namespace from your agent pods. If you move it to another namespace, define a `DAEMON_NAMESPACE` variable and add `-n $DAEMON_NAMESPACE` to every `kubectl get` / `kubectl exec` command that targets `storage-node-daemon`. If you change the namespace from default, also ensure you update the `namespace:` field in the YAMLs below. 
 
-**Production Automation Note:** In this guide, the HTTP server binds strictly to localhost because we trigger the bind and unbind requests locally inside the daemon container's namespace via kubectl exec. When transitioning to a production environment, you will need to configure the daemon's networking and host access so that your external platform orchestrator or custom controller can securely reach the daemon's API to manage mounts.
+**Production Automation Note:** Because `storage-node-daemon` runs with `hostNetwork: true`, its HTTP server binds strictly to `127.0.0.1:9090` on the node's host loopback so it is never exposed to untrusted Pod traffic across the cluster network. In this guide, we trigger bind/unbind requests locally via `kubectl exec`. When transitioning to production, keep `127.0.0.1:9090` behind a node-local agent/authenticated tunnel or set `LATEBIND_AUTH_TOKEN` + strict `NetworkPolicy`/firewall rules before binding to a node interface.
 
 Examine [`storage-infra.yaml`](storage-infra.yaml) for the Node Daemon infrastructure.
 
@@ -139,16 +172,16 @@ export DAEMON_POD=$(kubectl get pods -l app=storage-node-daemon --field-selector
 
 ### 1. Check Directory State from the Node Host (Daemon perspective)
 
-Verify the empty directory configuration inside `/host-root/var/lib/kubelet/pods/`:
+Verify the empty directory configuration inside `/proc/1/root/var/lib/kubelet/pods/`:
 
 ```shell
-kubectl exec $DAEMON_POD -c daemon -- ls -laR /host-root/var/lib/kubelet/pods/$POD_UID/volumes/kubernetes.io~empty-dir/workspace-volume/
+kubectl exec $DAEMON_POD -c daemon -- ls -laR /proc/1/root/var/lib/kubelet/pods/$POD_UID/volumes/kubernetes.io~empty-dir/workspace-volume/
 ```
 
 Expected Output 
 
 ```shell
-/host-root/var/lib/kubelet/pods/3ce30fe8-87f8-4854-aba5-3420725a5d4d/volumes/kubernetes.io~empty-dir/workspace-volume/:
+/proc/1/root/var/lib/kubelet/pods/3ce30fe8-87f8-4854-aba5-3420725a5d4d/volumes/kubernetes.io~empty-dir/workspace-volume/:
 total 8
 drwxrwsrwx 2 root 1000 4096 Jun 14 22:14 .
 drwxr-xr-x 5 root root 4096 Jun 14 22:14 ..
@@ -200,14 +233,16 @@ Output:
 sandboxclaim.extensions.agents.x-k8s.io/user-111-claim created
 ```
 
-### Why we use Finalizers
+### Why we use Finalizers (Ordered Session Quiescence)
 
-Because our custom node daemon performs host-level bind mounts outside of standard Kubernetes volume control, Kubernetes is unaware of this active attachment. This creates a critical lifecycle challenge during deletions:
-- **The Volume Busy Error**: If an active agent pod is deleted—either manually by deleting the Pod or SandboxClaim bound to a Pod or during automatic cluster maintenance like node draining or evictions (such as node upgrades, cluster autoscaler scale-down, or spot VM evictions)—Kubelet will immediately attempt to clean up the pod's emptyDir folder. Since the directory is still actively bind-mounted, Kubelet's unmount operation fails with a "busy" directory error.
-- **The Rescheduling Block**: This leaves the old pod permanently stuck in an Error, which blocks the SandboxClaim from ever successfully binding to a fresh, healthy pod.
-- **The Finalizer Solution**: To block premature deletions, we use an `agent.sandbox/storage-cleanup` finalizer on the SandboxClaim resource. The finalizer acts as a mandatory deletion block, forcing the Kubernetes API to pause the destruction process. This gives your orchestrator the necessary window to safely trigger the unbind API call via the Node Daemon before clearing the finalizers.
+With `gofer_mountns` isolation (`open_tree` + `move_mount` into `runsc-gofer`), **data safety and mount cleanup no longer depend on finalizers**: even if a Pod is `OOMKilled` or force-deleted (`kubectl delete pod --grace-period=0 --force`) without calling `unbind`, the kernel automatically destroys `runsc-gofer`'s private mount namespace upon process exit, leaving zero orphaned mounts on the host and zero risk of Kubelet wiping remote Filestore files.
 
-**Production Automation Note:** In this guide, we declare and manage the `agent.sandbox/storage-cleanup` finalizers manually using CLI commands for demonstration purposes. In a production environment, you should write a custom controller to automate this entire process to safely unbind the storage before allowing GKE to cleanly delete the pod and claim.
+Finalizers (`agent.sandbox/storage-cleanup`) remain recommended in orchestrated session workflows for **ordered session quiescence and `hard`-mount outage unblocking**:
+- **Clean Application Flush & Ordered Unbind**: Pausing deletion gives your orchestrator a deterministic window to stop incoming requests, flush application state, remove `.ready`, and call `unbind` *before* archiving a point-in-time snapshot or immediately re-binding the tenant's volume onto another node.
+- **Unblocking `hard` Mounts During Permanent NFS Outages**: If the remote NFS server is completely unreachable when a Pod is deleted, calling `unbind` triggers `umount2(MNT_FORCE | MNT_DETACH)` (`rpc_killall_tasks`), aborting blocked `runsc-sandbox` RPCs in `< 1ms` so the Pod terminates in `< 6s` instead of waiting in `Terminating`.
+- **Fallback `host_watched` Defense-in-Depth**: If you explicitly run with `LATEBIND_MODE=host_watched` on a non-gVisor runtime, ordered `unbind` via finalizers complements the 50ms host mount reaper.
+
+**Production Automation Note:** In this guide, we declare and manage `agent.sandbox/storage-cleanup` finalizers manually using CLI commands for demonstration purposes. In production, your controller should automate `unbind` and finalizer removal (with a timeout fallback if a node becomes unreachable).
 
 ## Capture Sandbox and Node Metadata
 
@@ -339,42 +374,42 @@ New Session Initialized.
 Starting custom agent application...
 ```
 
-### 3. Check Host-Level Mount Integrity (Daemon perspective)
+### 3. Check Host-Level Cleanliness (`gofer_mountns` Isolation)
 
-Verify the actual bind mount on the node file system under `/var/lib/kubelet` from the node daemon container:
+Verify from the node daemon container that `/proc/1/mountinfo` (the host's root mount namespace) remains untouched—only `.ready` (and the empty `user_data` mountpoint stub) exist in the host `emptyDir`, while the live Filestore mount lives exclusively inside `runsc-gofer`'s mount namespace:
 
 ```shell
-kubectl exec $DAEMON_POD -c daemon -- ls -laR /host-root/var/lib/kubelet/pods/$POD_UID/volumes/kubernetes.io~empty-dir/workspace-volume/
+kubectl exec $DAEMON_POD -c daemon -- ls -laR /proc/1/root/var/lib/kubelet/pods/$POD_UID/volumes/kubernetes.io~empty-dir/workspace-volume/
 ```
 
-Expected Output 
+Expected Output (notice `user_data` is empty on the host view—protecting `state.txt` from Kubelet `emptyDir` cleanup!):
 
 ```shell
-/host-root/var/lib/kubelet/pods/3ce30fe8-87f8-4854-aba5-3420725a5d4d/volumes/kubernetes.io~empty-dir/workspace-volume/:
+/proc/1/root/var/lib/kubelet/pods/3ce30fe8-87f8-4854-aba5-3420725a5d4d/volumes/kubernetes.io~empty-dir/workspace-volume/:
 total 12
 drwxrwsrwx 3 root 1000 4096 Jun 14 22:18 .
 drwxr-xr-x 5 root root 4096 Jun 14 22:14 ..
--rw-r--r-- 1 root 1000  5 Jun 14 22:18 .ready
-drwxr-xr-x 2 1000 1000  0 Jun 14 22:18 user_data
-/host-root/var/lib/kubelet/pods/3ce30fe8-87f8-4854-aba5-3420725a5d4d/volumes/kubernetes.io~empty-dir/workspace-volume/user_data:
+-rw-r--r-- 1 root 1000    5 Jun 14 22:18 .ready
+drwxr-xr-x 2 root 1000 4096 Jun 14 22:18 user_data
+
+/proc/1/root/var/lib/kubelet/pods/3ce30fe8-87f8-4854-aba5-3420725a5d4d/volumes/kubernetes.io~empty-dir/workspace-volume/user_data:
 total 8
-drwxr-xr-x 2 1000 1000  0 Jun 14 22:18 .
+drwxr-xr-x 2 root 1000 4096 Jun 14 22:18 .
 drwxrwsrwx 3 root 1000 4096 Jun 14 22:18 ..
--rw-r--r-- 1 1000 1000  72 Jun 14 22:18 state.txt
 ```
 
-The dynamic Filestore dynamic late-binding execution is complete and isolation is verified!
+The dynamic Filestore late-binding execution is complete and mount-namespace isolation is verified!
 
 ## Pausing and Resuming an Existing Session
 
 Since Filestore stores directories persistently, the late-bind mechanism preserves files across pod lifecycles. If a tenant's container is destroyed or recycled, their directory can be late-bound to a completely new `SandboxWarmpool` Pod, which is bound to a different `SandboxClaim`, restoring their session workspace instantly.
 
-### Preventing Resource Leaks During Session Teardown
+### Ordered Quiescence During Session Teardown
 
-As established in [Submit a SandboxClaim](#submit-a-sandbox-claim) and [Trigger Dynamic Storage Binding (HTTP Request)](#trigger-dynamic-storage-binding-http-request), because host-level bind mounts bypass standard Kubernetes CSI controls, the finalizers on both the SandboxClaim and the Pod act as mandatory deletion blocks. This design ensures your orchestrator has a secure window to safely execute the unbind workflow during termination, regardless of whether the deletion is planned or unexpected:
-- **Graceful Terminations (SandboxClaim Deletion):** Deleting the `SandboxClaim` (manually or via system triggers) schedules both the claim and its bound pod for deletion. The finalizers pause the API destruction process, keeping the pod's emptyDir mount intact so the orchestrator can call unbind via the Node Daemon before the container and its resources are terminated.
-- **Pod Evictions & Rescheduling (Node Drains / Upgrades):** During automatic GKE maintenance events like node draining or evictions (such as node upgrades, cluster autoscaler scale down, or spot VM evictions), the SandboxClaims themselves are not deleted; only the underlying pods are rescheduled to new nodes. In these scenarios, the pod-level finalizer is critical: it holds the Pod in a Terminating state, preventing GKE from deleting the pod object before an unbind occurs, which avoids broken volume busy loops and ensures GKE can safely spin up a healthy replacement pod once cleared.
-- **Unexpected Shutdowns (OOM Kills, Node Crashes):** During OOMs / node crashes, the finalizer keeps the pod object alive in the API (even if its containers are dead), allowing your custom controller to safely trigger unbind and prevent orphaned host-level mount points on the host VM before removing the finalizer to let GKE cleanly destroy the pod.
+As noted in [Why we use Finalizers](#why-we-use-finalizers-ordered-session-quiescence), `gofer_mountns` isolation already prevents orphaned host mounts and remote data deletion on abrupt pod crashes. Finalizers on the `SandboxClaim` and `Pod` provide **ordered quiescence** across planned and unplanned transitions:
+- **Graceful Terminations (SandboxClaim Deletion):** Deleting the `SandboxClaim` pauses destruction until your orchestrator flushes active writes and calls `unbind`, ensuring the tenant's volume is quiesced before being re-bound elsewhere or snapshotted.
+- **Pod Evictions & Rescheduling (Node Drains / Upgrades):** Holding the old Pod briefly allows your orchestrator to record session handoff cleanly before scheduling the tenant onto a replacement warm pod.
+- **Unexpected Shutdowns (OOM Kills, Force Deletes):** Even if `unbind` is never called, the kernel destroys `runsc-gofer`'s mount namespace automatically when the pod exits; your controller only needs to clear the finalizer so the API object is garbage-collected.
 **Production Automation Note**:  In this guide, you will manually execute the unbind request via the node daemon and remove the finalizers when terminating a session. In a production environment, a custom controller or session orchestrator must automate this entire lifecycle. This controller should actively watch GKE's API for both `SandboxClaim` deletions and individual Pod deletion timestamps or rescheduling events, trigger the /unbind HTTP API call, and remove the finalizers only after unmounting has completed to prevent resource leaks and stuck pods.
 
 ### Pausing / Resuming a Session

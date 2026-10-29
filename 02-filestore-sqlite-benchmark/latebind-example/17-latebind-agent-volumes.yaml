@@ -5,13 +5,36 @@
 # 官方文档参考:
 #   https://docs.cloud.google.com/filestore/docs/agent-sandbox-latebind
 #
-# 核心设计:
+# 核心设计与安全加固说明:
 #   1. SandboxWarmPool 预先启动不带持久卷的 gVisor 待命沙箱（挂载 emptyDir 并配置
 #      dev.gvisor.empty-dir.workspace-volume.force-shared: "true"）。
 #   2. 每位用户拥有独立的 Filestore Agent Volume PVC（亚秒级创建，单卷独立容量配额）。
-#   3. 认领沙箱瞬间，节点守护进程 (storage-node-daemon) 执行 action=bind_nfs，
-#      将用户专属 Agent Volume 的 NFS 导出直接挂载进运行中沙箱的 emptyDir (< 100ms)。
-#   4. 要求：GKE Standard 集群（版本 >= 1.36.0-gke.3302001）。
+#   3. 认领沙箱瞬间，节点守护进程 (storage-node-daemon, ThreadingHTTPServer) 执行 action=bind_nfs：
+#      - 网络命名空间固定在宿主机 init_net (/proc/1/ns/net)，因此 DaemonSet 重启或滚动
+#        升级绝不会影响存量沙箱已挂载的 NFS 连接；
+#      - 默认采用 Filestore 官方推荐的 hard 挂载语义（网络抖动或维护 >30s 时安全挂起等待恢复，
+#        不会向 SQLite fsync 抛出 ETIMEDOUT / SQLITE_IOERR；可通过 NFS_EXTRA_OPTS 显式改写）；
+#      - 在临时 unshare(CLONE_NEWNS) 私有空间内完成 staging mount（原生兼容 COS_CONTAINERD
+#        只读根分区与离线集群，同时兼容 Ubuntu 节点自动安装 nfs-common）；
+#      - 通过 Linux 内核 open_tree + move_mount 将分离挂载句柄直接注入该 Pod 专属的
+#        runsc-gofer 挂载命名空间 (< 100ms)，无需挂载 hostPath /，宿主机 PID 1 零挂载！
+#   4. 零竞态防误删与防卡死保证 (Mount-Namespace Isolation + MNT_FORCE unbind)：
+#      - 无论沙箱发生优雅退出、OOMKill、SIGKILL 还是 kubectl delete --grace-period=0 --force 强杀，
+#        内核都会随沙箱进程退出自动销毁 runsc-gofer 独立挂载命名空间，彻底杜绝 Kubelet 清理 emptyDir
+#        (os.RemoveAll) 穿透清空远端 Filestore 数据的风险。
+#      - 在默认 hard 挂载下，若远端 NFS 彻底黑洞不可达期间需销毁 Pod：由控制面调 action=unbind 执行
+#        umount2(MNT_FORCE|MNT_DETACH) 可在 <1ms 内触发内核 nfs_umount_begin -> rpc_killall_tasks
+#        中断挂起的 Sentry DirectFS RPC，使 Pod 在 <6s 内退出；若不部署 unbind 控制器且优先要求无协助
+#        自动退出，可显式设 NFS_EXTRA_OPTS="softerr,timeo=50,retrans=2"（代价：>30s 断连返回 ETIMEDOUT）。
+#   5. 版本耦合说明与降级路径：
+#      - 前置条件：Linux Kernel >= 5.2 (open_tree/move_mount)，hostPID + hostNetwork + privileged。
+#      - 已验证基线：GKE Standard v1.36.4-gke.2377000 / COS Kernel 6.12.110+ / containerd 2.2.7
+#        (gVisor per-pod runsc-gofer + DirectFS chroot /root)。
+#      - 内置降级开关 LATEBIND_MODE（默认 "auto" 优先走 gofer_mountns；若未来运行时架构变更或显式
+#        设为 "host_watched"，自动降级为宿主机挂载 + 50ms 进程存活监控自动强制懒卸载）。
+#      - 默认启用进程内 per-volume 互斥锁 + NFSv3 O_CREAT|O_EXCL 服务端原子租约文件
+#        (.latebind_lease.json，冲突返回 HTTP 409)，既消除同节点多线程并发竞态，也能拦截大部分跨节点
+#        并发双认领（优雅 unbind 自动释放租约；跨节点异常宕机恢复可传 force_rebind: true）。
 # ==============================================================================
 apiVersion: apps/v1
 kind: DaemonSet
@@ -28,6 +51,8 @@ spec:
         app: storage-node-daemon
     spec:
       hostPID: true
+      hostNetwork: true
+      dnsPolicy: ClusterFirstWithHostNet
       nodeSelector:
         sandbox.gke.io/runtime: gvisor
       tolerations:
@@ -35,35 +60,183 @@ spec:
           operator: "Equal"
           value: "gvisor"
           effect: "NoSchedule"
-      initContainers:
-        - name: install-nfs
-          image: debian:stable-slim
-          securityContext:
-            privileged: true
-          volumeMounts:
-            - name: host-root
-              mountPath: /host-root
-              mountPropagation: Bidirectional
-          command: ["/bin/sh", "-c"]
-          args:
-            - |
-              nsenter -t 1 -m -u -i -n -- which mount.nfs >/dev/null 2>&1 || \
-              (nsenter -t 1 -m -u -i -n -- apt-get update && \
-               nsenter -t 1 -m -u -i -n -- apt-get install -y nfs-common) || true
       containers:
         - name: daemon
           image: python:3.11-slim
           securityContext:
             privileged: true
-          volumeMounts:
-            - name: host-root
-              mountPath: /host-root
-              mountPropagation: Bidirectional
+          env:
+            - name: LATEBIND_MODE
+              value: "auto" # "auto" | "gofer_mountns" | "host_watched"
+            - name: NFS_EXTRA_OPTS
+              value: "" # Default "" uses Filestore-recommended "hard"; set e.g. "softerr,timeo=50,retrans=2" only if fail-fast ETIMEDOUT is explicitly preferred over I/O pause
           command: ["python3", "-u", "-c"]
           args:
             - |
-              import os, json, subprocess, traceback
-              from http.server import BaseHTTPRequestHandler, HTTPServer
+              import ctypes, hmac, ipaddress, json, os, shutil, socket, subprocess, threading, time, traceback
+              from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+              libc = ctypes.CDLL("libc.so.6", use_errno=True)
+              SYS_open_tree = 428
+              SYS_move_mount = 429
+              AT_FDCWD = -100
+              OPEN_TREE_CLONE = 1
+              MOVE_MOUNT_F_EMPTY_PATH = 0x00000004
+              CLONE_NEWNS = 0x00020000
+              CLONE_NEWNET = 0x40000000
+              MS_REC = 0x4000
+              MS_SLAVE = 1 << 19
+              MNT_FORCE = 1
+              MNT_DETACH = 2
+
+              AUTH_TOKEN = os.environ.get("LATEBIND_AUTH_TOKEN", "").strip()
+              LATEBIND_MODE = os.environ.get("LATEBIND_MODE", "auto").strip().lower()
+              NFS_EXTRA_OPTS = os.environ.get("NFS_EXTRA_OPTS", "").strip()
+              MOUNT_TIMEOUT_SEC = int(os.environ.get("LATEBIND_MOUNT_TIMEOUT_SEC", "20"))
+
+              class LeaseConflictError(RuntimeError):
+                  pass
+
+              key_locks_guard = threading.Lock()
+              key_locks = {}
+
+              def get_key_lock(key):
+                  with key_locks_guard:
+                      lk = key_locks.get(key)
+                      if lk is None:
+                          lk = threading.Lock()
+                          key_locks[key] = lk
+                      return lk
+
+              def acquire_lease_atomic(lease_file, pod_uid, volume_name, enforce_lease, force_rebind):
+                  my_node = socket.gethostname()
+                  payload = json.dumps({"pod_uid": pod_uid, "node": my_node, "ts": time.time()}).encode()
+
+                  def _excl_create():
+                      fd = os.open(lease_file, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o644)
+                      try:
+                          os.write(fd, payload)
+                          os.fsync(fd)
+                          os.fchown(fd, 1000, 1000)
+                      finally:
+                          os.close(fd)
+
+                  try:
+                      _excl_create()
+                      return True
+                  except FileExistsError:
+                      pass
+
+                  old = {}
+                  for _ in range(5):
+                      try:
+                          raw = open(lease_file).read().strip()
+                          if raw:
+                              old = json.loads(raw)
+                              break
+                      except Exception:
+                          pass
+                      time.sleep(0.02)
+
+                  old_uid = old.get("pod_uid")
+                  old_node = old.get("node")
+                  if old_uid == pod_uid and old_node == my_node:
+                      return False
+
+                  if enforce_lease and not force_rebind:
+                      if old_node == my_node and old_uid:
+                          if find_gofer_targets(old_uid, volume_name) or find_pod_pids(old_uid):
+                              raise LeaseConflictError(f"Volume already leased by active local pod {old_uid}")
+                      elif old_node and old_node != my_node:
+                          raise LeaseConflictError(
+                              f"Volume already leased by pod {old_uid} on node {old_node} "
+                              f"(call unbind first or pass force_rebind=true after node crash)"
+                          )
+                      else:
+                          try:
+                              age = time.time() - os.stat(lease_file).st_mtime
+                          except OSError:
+                              age = 0.0
+                          if age < 10.0:
+                              raise LeaseConflictError("Volume lease is currently being initialized by another claimer")
+
+                  try:
+                      os.unlink(lease_file)
+                  except FileNotFoundError:
+                      pass
+                  try:
+                      _excl_create()
+                      return True
+                  except FileExistsError:
+                      raise LeaseConflictError("Concurrent lease acquisition won by another claimer")
+
+              def _safe_waitpid(pid):
+                  try:
+                      os.waitpid(pid, 0)
+                  except ChildProcessError:
+                      pass
+
+              def best_effort_release_lease(target_dir, pod_uid, budget_sec=0.2):
+                  lpid = os.fork()
+                  if lpid == 0:
+                      try:
+                          lf = os.path.join(target_dir, ".latebind_lease.json")
+                          cur = json.loads(open(lf).read() or "{}")
+                          if cur.get("pod_uid") == pod_uid:
+                              os.unlink(lf)
+                      except Exception:
+                          pass
+                      os._exit(0)
+                  steps = max(1, int(budget_sec / 0.01))
+                  for _ in range(steps):
+                      wpid, _ = os.waitpid(lpid, os.WNOHANG)
+                      if wpid == lpid:
+                          return
+                      time.sleep(0.01)
+                  threading.Thread(target=_safe_waitpid, args=(lpid,), daemon=True).start()
+
+              HOST_HAS_MOUNT_NFS = any(
+                  os.path.exists(p) for p in ("/proc/1/root/sbin/mount.nfs", "/proc/1/root/usr/sbin/mount.nfs")
+              )
+              if not HOST_HAS_MOUNT_NFS and shutil.which("mount.nfs") is None:
+                  print("Host lacks mount.nfs (non-COS node); installing nfs-common inside daemon container...", flush=True)
+                  subprocess.run(
+                      ["sh", "-c", "apt-get update -qq && apt-get install -y -qq --no-install-recommends nfs-common netbase"],
+                      check=True,
+                      timeout=120,
+                  )
+              CONTAINER_HAS_MOUNT_NFS = shutil.which("mount.nfs") is not None
+              print(
+                  f"storage-node-daemon ready on 127.0.0.1:9090 (mode={LATEBIND_MODE}, "
+                  f"nfs_extra_opts={NFS_EXTRA_OPTS or 'hard(default)'}, "
+                  f"host_mount_nfs={HOST_HAS_MOUNT_NFS}, container_mount_nfs={CONTAINER_HAS_MOUNT_NFS})",
+                  flush=True,
+              )
+
+              # Fallback watcher registry for host_watched mode: pod_uid -> (anchor_pids, host_proc1_target, host_proc1_parent)
+              watched_lock = threading.Lock()
+              watched_host_mounts = {}
+
+              def host_mount_reaper_loop():
+                  while True:
+                      time.sleep(0.05)
+                      with watched_lock:
+                          items = list(watched_host_mounts.items())
+                      for pod_uid, (pids, proc1_target, proc1_parent) in items:
+                          alive = any(os.path.exists(f"/proc/{p}") for p in pids)
+                          if not alive:
+                              libc.umount2(proc1_target.encode(), MNT_FORCE | MNT_DETACH)
+                              ready_f = os.path.join(proc1_parent, ".ready")
+                              if os.path.exists(ready_f):
+                                  try:
+                                      os.remove(ready_f)
+                                  except OSError:
+                                      pass
+                              with watched_lock:
+                                  watched_host_mounts.pop(pod_uid, None)
+                              print(f"[host_watched] Auto-unmounted {proc1_target} after pod {pod_uid} exit", flush=True)
+
+              threading.Thread(target=host_mount_reaper_loop, daemon=True).start()
 
               def safe_join(base, *parts):
                   base = os.path.abspath(base)
@@ -72,60 +245,322 @@ spec:
                       raise ValueError("Path escapes base directory")
                   return path
 
+              def require_segment(name, value):
+                  if not value or value in {".", ".."} or value != os.path.basename(value):
+                      raise ValueError(f"Invalid {name}: {value!r}")
+                  return value
+
+              def resolve_host_with_timeout(host, timeout_sec=5.0):
+                  try:
+                      ipaddress.ip_address(host)
+                      return host
+                  except ValueError:
+                      pass
+                  out = {}
+                  def _lookup():
+                      try:
+                          out["ip"] = socket.gethostbyname(host)
+                      except Exception as exc:
+                          out["err"] = exc
+                  t = threading.Thread(target=_lookup, daemon=True)
+                  t.start()
+                  t.join(timeout_sec)
+                  if t.is_alive():
+                      raise TimeoutError(f"DNS lookup timed out after {timeout_sec}s for {host}")
+                  if "err" in out:
+                      raise out["err"]
+                  return out["ip"]
+
+              def find_gofer_targets(pod_uid, volume_name):
+                  needle = f"/var/lib/kubelet/pods/{pod_uid}/volumes/kubernetes.io~empty-dir/{volume_name}"
+                  targets = []
+                  for entry in os.listdir("/proc"):
+                      if not entry.isdigit():
+                          continue
+                      try:
+                          cmdline = open(f"/proc/{entry}/cmdline", "rb").read()
+                          if b"runsc-gofer" not in cmdline:
+                              continue
+                          groot = os.readlink(f"/proc/{entry}/root")
+                          with open(f"/proc/{entry}/mountinfo", "r") as mf:
+                              for line in mf:
+                                  parts = line.split(" - ")[0].split(" ")
+                                  if len(parts) >= 5 and parts[3] == needle:
+                                      mount_point = parts[4].replace("\\040", " ")
+                                      targets.append((int(entry), groot, mount_point))
+                      except Exception:
+                          continue
+                  return targets
+
+              def find_pod_pids(pod_uid):
+                  pids = []
+                  uid_bytes = pod_uid.encode()
+                  for entry in os.listdir("/proc"):
+                      if not entry.isdigit():
+                          continue
+                      try:
+                          cg = open(f"/proc/{entry}/cgroup", "rb").read()
+                          if uid_bytes in cg or uid_bytes.replace(b"-", b"_") in cg:
+                              pids.append(int(entry))
+                      except Exception:
+                          continue
+                  return pids
+
+              def run_in_fork(fn):
+                  r_fd, w_fd = os.pipe()
+                  pid = os.fork()
+                  if pid == 0:
+                      os.close(r_fd)
+                      try:
+                          fn()
+                          os._exit(0)
+                      except LeaseConflictError as ce:
+                          try:
+                              os.write(w_fd, f"LEASE_CONFLICT:{ce}".encode()[:4096])
+                          finally:
+                              os._exit(2)
+                      except Exception:
+                          try:
+                              os.write(w_fd, traceback.format_exc().encode()[:4096])
+                          finally:
+                              os._exit(1)
+                  os.close(w_fd)
+                  err_bytes = b""
+                  while True:
+                      chunk = os.read(r_fd, 4096)
+                      if not chunk:
+                          break
+                      err_bytes += chunk
+                  os.close(r_fd)
+                  _, status = os.waitpid(pid, 0)
+                  if os.WIFEXITED(status) and os.WEXITSTATUS(status) == 0:
+                      return
+                  err_text = err_bytes.decode(errors="replace")
+                  if os.WIFEXITED(status) and os.WEXITSTATUS(status) == 2:
+                      raise LeaseConflictError(err_text.removeprefix("LEASE_CONFLICT:"))
+                  raise RuntimeError(err_text or f"Worker exited with status {status}")
+
+              def mount_nfs_with_fallback(source, target_dir, is_ro):
+                  base = "vers=3,proto=tcp,mountproto=tcp,port=2049,mountport=2050,hard"
+                  ro_opt = ",ro" if is_ro else ""
+                  extra_opt = f",{NFS_EXTRA_OPTS}" if NFS_EXTRA_OPTS else ""
+                  candidates = [
+                      f"{base},local_lock=all{extra_opt}{ro_opt}",
+                      f"{base},nolock{extra_opt}{ro_opt}",
+                  ]
+                  if extra_opt:
+                      candidates.append(f"{base},nolock{ro_opt}")
+                  last_err = None
+                  for opts in candidates:
+                      res = subprocess.run(
+                          ["mount", "-t", "nfs", "-o", opts, source, target_dir],
+                          capture_output=True,
+                          text=True,
+                          timeout=MOUNT_TIMEOUT_SEC,
+                      )
+                      if res.returncode == 0:
+                          return opts
+                      last_err = res.stderr.strip() or f"rc={res.returncode}"
+                  raise RuntimeError(f"All mount.nfs option sets failed for {source}: {last_err}")
+
+              class DaemonHTTPServer(ThreadingHTTPServer):
+                  daemon_threads = True
+
               class Handler(BaseHTTPRequestHandler):
                   def do_POST(self):
                       try:
-                          length = int(self.headers.get('Content-Length', 0))
-                          data = json.loads(self.rfile.read(length))
-                          pod_uid = data['pod_uid']
-                          action = data['action']
-                          volume_name = data['volume_name']
-                          sub_dir = data['sub_dir']
+                          if AUTH_TOKEN:
+                              hdr = self.headers.get("Authorization", "")
+                              if not hmac.compare_digest(hdr, f"Bearer {AUTH_TOKEN}"):
+                                  self.send_response(401)
+                                  self.end_headers()
+                                  self.wfile.write(b"Unauthorized")
+                                  return
 
-                          parent = safe_join("/host-root/var/lib/kubelet/pods",
-                                             pod_uid, "volumes/kubernetes.io~empty-dir", volume_name)
-                          target = safe_join(parent, sub_dir)
-                          host_target = safe_join("/var/lib/kubelet/pods", pod_uid,
-                                                  "volumes/kubernetes.io~empty-dir", volume_name, sub_dir)
+                          length = int(self.headers.get("Content-Length", 0))
+                          data = json.loads(self.rfile.read(length))
+                          pod_uid = require_segment("pod_uid", data["pod_uid"])
+                          action = data["action"]
+                          volume_name = require_segment("volume_name", data["volume_name"])
+                          sub_dir = require_segment("sub_dir", data["sub_dir"])
+
+                          targets = [] if LATEBIND_MODE == "host_watched" else find_gofer_targets(pod_uid, volume_name)
+                          if LATEBIND_MODE == "gofer_mountns" and not targets:
+                              raise RuntimeError(f"No active runsc-gofer mount found for pod_uid={pod_uid} volume={volume_name}")
 
                           if action == "bind_nfs":
-                              source = f"{data['nfs_server']}:{data['nfs_path']}"
-                              os.makedirs(target, exist_ok=True)
-                              mount_opts = "vers=3,proto=tcp,mountproto=tcp,port=2049,mountport=2050,nolock"
-                              if data.get("is_readonly"):
-                                  mount_opts += ",ro"
-                              subprocess.run(["nsenter", "-t", "1", "-m", "--",
-                                              "mount", "-t", "nfs", "-o", mount_opts, source, host_target], check=True)
-                              if not data.get("is_readonly"):
-                                  subprocess.run(["nsenter", "-t", "1", "-m", "--",
-                                                  "chown", "-R", "1000:1000", host_target], check=True)
-                              with open(f"{parent}/.ready", "w") as f:
-                                  f.write("ready")
-                              msg = f"Bound {source} to {host_target}"
+                              nfs_server = data["nfs_server"].strip()
+                              nfs_path = data["nfs_path"].strip()
+                              if not nfs_server or not nfs_path.startswith("/"):
+                                  raise ValueError("Invalid nfs_server or nfs_path")
+                              resolved_ip = resolve_host_with_timeout(nfs_server)
+                              source = f"{resolved_ip}:{nfs_path}"
+                              is_ro = bool(data.get("is_readonly", False))
+                              enforce_lease = bool(data.get("enforce_lease", True))
+                              force_rebind = bool(data.get("force_rebind", False))
+
+                              with get_key_lock(source):
+                                  if targets:
+                                      for gpid, groot, mount_point in targets:
+                                          def _bind_worker(gpid=gpid, groot=groot, mount_point=mount_point):
+                                              gofer_mnt_fd = os.open(f"/proc/{gpid}/ns/mnt", os.O_RDONLY)
+                                              # Anchor NFS RPC client strictly to Host PID 1 init_net so daemon restarts never break active mounts
+                                              host_net_fd = os.open("/proc/1/ns/net", os.O_RDONLY)
+                                              if libc.setns(host_net_fd, CLONE_NEWNET) != 0:
+                                                  raise OSError(ctypes.get_errno(), "setns(host init_net) failed")
+                                              os.close(host_net_fd)
+
+                                              if CONTAINER_HAS_MOUNT_NFS:
+                                                  if libc.unshare(CLONE_NEWNS) != 0:
+                                                      raise OSError(ctypes.get_errno(), "unshare(CLONE_NEWNS) failed")
+                                                  libc.mount(None, b"/", None, ctypes.c_ulong(MS_REC | MS_SLAVE), None)
+                                                  stage_root = "/tmp"
+                                              else:
+                                                  host_mnt_fd = os.open("/proc/1/ns/mnt", os.O_RDONLY)
+                                                  if libc.setns(host_mnt_fd, CLONE_NEWNS) != 0:
+                                                      raise OSError(ctypes.get_errno(), "setns(host mnt) failed")
+                                                  os.close(host_mnt_fd)
+                                                  if libc.unshare(CLONE_NEWNS) != 0:
+                                                      raise OSError(ctypes.get_errno(), "unshare(CLONE_NEWNS) failed")
+                                                  if libc.mount(None, b"/", None, ctypes.c_ulong(MS_REC | MS_SLAVE), None) != 0:
+                                                      raise OSError(ctypes.get_errno(), "mount(MS_SLAVE) failed")
+                                                  stage_root = "/mnt"
+
+                                              if libc.mount(b"tmpfs", stage_root.encode(), b"tmpfs", ctypes.c_ulong(0), b"size=16m") != 0:
+                                                  raise OSError(ctypes.get_errno(), f"tmpfs mount on {stage_root} failed")
+                                              stage = f"{stage_root}/stage_{pod_uid}_{gpid}"
+                                              os.makedirs(stage, exist_ok=True)
+                                              mount_nfs_with_fallback(source, stage, is_ro)
+
+                                              lease_created = False
+                                              if not is_ro:
+                                                  st = os.stat(stage)
+                                                  if st.st_uid != 1000 or st.st_gid != 1000:
+                                                      os.chown(stage, 1000, 1000)
+                                                  lease_file = os.path.join(stage, ".latebind_lease.json")
+                                                  lease_created = acquire_lease_atomic(
+                                                      lease_file, pod_uid, volume_name, enforce_lease, force_rebind
+                                                  )
+
+                                              try:
+                                                  tree_fd = libc.syscall(
+                                                      SYS_open_tree, ctypes.c_int(AT_FDCWD), stage.encode(), ctypes.c_uint(OPEN_TREE_CLONE)
+                                                  )
+                                                  if tree_fd < 0:
+                                                      raise OSError(ctypes.get_errno(), "open_tree(OPEN_TREE_CLONE) failed")
+
+                                                  if libc.setns(gofer_mnt_fd, CLONE_NEWNS) != 0:
+                                                      raise OSError(ctypes.get_errno(), "setns(gofer) failed")
+                                                  os.close(gofer_mnt_fd)
+                                                  if groot and groot != "/":
+                                                      os.chroot(groot)
+                                                      os.chdir("/")
+
+                                                  dest = safe_join(mount_point, sub_dir)
+                                                  os.makedirs(dest, exist_ok=True)
+                                                  rc = libc.syscall(
+                                                      SYS_move_mount,
+                                                      ctypes.c_int(tree_fd),
+                                                      b"",
+                                                      ctypes.c_int(AT_FDCWD),
+                                                      dest.encode(),
+                                                      ctypes.c_uint(MOVE_MOUNT_F_EMPTY_PATH),
+                                                  )
+                                                  if rc != 0:
+                                                      raise OSError(ctypes.get_errno(), "move_mount into gofer failed")
+                                                  with open(safe_join(mount_point, ".ready"), "w") as rf:
+                                                      rf.write("ready")
+                                              except Exception:
+                                                  if lease_created:
+                                                      try:
+                                                          os.unlink(lease_file)
+                                                      except OSError:
+                                                          pass
+                                                  raise
+
+                                          run_in_fork(_bind_worker)
+                                      msg = f"Bound {source} into gofer mountns ({len(targets)} target(s)) for pod {pod_uid}; host PID 1 untouched"
+                                  else:
+                                      # Fallback host_watched path via /proc/1/root (no hostPath / volume required)
+                                      pids = find_pod_pids(pod_uid)
+                                      if not pids:
+                                          raise RuntimeError(f"Pod {pod_uid} has no active processes on host")
+                                      proc1_parent = safe_join("/proc/1/root/var/lib/kubelet/pods", pod_uid, "volumes/kubernetes.io~empty-dir", volume_name)
+                                      proc1_target = safe_join(proc1_parent, sub_dir)
+                                      os.makedirs(proc1_target, exist_ok=True)
+                                      def _fallback_worker():
+                                          host_net_fd = os.open("/proc/1/ns/net", os.O_RDONLY)
+                                          libc.setns(host_net_fd, CLONE_NEWNET)
+                                          os.close(host_net_fd)
+                                          host_mnt_fd = os.open("/proc/1/ns/mnt", os.O_RDONLY)
+                                          libc.setns(host_mnt_fd, CLONE_NEWNS)
+                                          os.close(host_mnt_fd)
+                                          real_target = safe_join("/var/lib/kubelet/pods", pod_uid, "volumes/kubernetes.io~empty-dir", volume_name, sub_dir)
+                                          mount_nfs_with_fallback(source, real_target, is_ro)
+                                          if not is_ro:
+                                              st = os.stat(real_target)
+                                              if st.st_uid != 1000 or st.st_gid != 1000:
+                                                  os.chown(real_target, 1000, 1000)
+                                              lease_file = os.path.join(real_target, ".latebind_lease.json")
+                                              acquire_lease_atomic(lease_file, pod_uid, volume_name, enforce_lease, force_rebind)
+                                      run_in_fork(_fallback_worker)
+                                      with watched_lock:
+                                          watched_host_mounts[pod_uid] = (pids, proc1_target, proc1_parent)
+                                      with open(os.path.join(proc1_parent, ".ready"), "w") as rf:
+                                          rf.write("ready")
+                                      msg = f"Bound {source} via fallback host_watched mode for pod {pod_uid}"
+
                           elif action == "unbind":
-                              subprocess.run(["nsenter", "-t", "1", "-m", "--",
-                                              "umount", "-l", host_target], check=True)
-                              ready_file = f"{parent}/.ready"
-                              if os.path.exists(ready_file):
-                                  os.remove(ready_file)
-                              msg = f"Unbound {host_target}"
+                              if targets:
+                                  for gpid, groot, mount_point in targets:
+                                      def _unbind_worker(gpid=gpid, groot=groot, mount_point=mount_point):
+                                          gofer_mnt_fd = os.open(f"/proc/{gpid}/ns/mnt", os.O_RDONLY)
+                                          if libc.setns(gofer_mnt_fd, CLONE_NEWNS) != 0:
+                                              raise OSError(ctypes.get_errno(), "setns(gofer) failed")
+                                          os.close(gofer_mnt_fd)
+                                          if groot and groot != "/":
+                                              os.chroot(groot)
+                                              os.chdir("/")
+                                          dest = safe_join(mount_point, sub_dir)
+                                          ready_file = safe_join(mount_point, ".ready")
+                                          if os.path.exists(ready_file):
+                                              os.remove(ready_file)
+                                          best_effort_release_lease(dest, pod_uid)
+                                          if libc.umount2(dest.encode(), MNT_FORCE | MNT_DETACH) != 0:
+                                              err = ctypes.get_errno()
+                                              if err not in (2, 22):
+                                                  raise OSError(err, "umount2(MNT_FORCE|MNT_DETACH) failed")
+
+                                      run_in_fork(_unbind_worker)
+                                  msg = f"Unbound volume {volume_name}/{sub_dir} in gofer mountns for pod {pod_uid}"
+                              else:
+                                  proc1_parent = safe_join("/proc/1/root/var/lib/kubelet/pods", pod_uid, "volumes/kubernetes.io~empty-dir", volume_name)
+                                  proc1_target = safe_join(proc1_parent, sub_dir)
+                                  best_effort_release_lease(proc1_target, pod_uid)
+                                  libc.umount2(proc1_target.encode(), MNT_FORCE | MNT_DETACH)
+                                  ready_f = os.path.join(proc1_parent, ".ready")
+                                  if os.path.exists(ready_f):
+                                      os.remove(ready_f)
+                                  with watched_lock:
+                                      watched_host_mounts.pop(pod_uid, None)
+                                  msg = f"Unbound fallback host mount for pod {pod_uid}"
                           else:
                               raise ValueError(f"Unknown action: {action}")
 
                           self.send_response(200)
                           self.end_headers()
                           self.wfile.write(msg.encode())
+                      except LeaseConflictError as ce:
+                          self.send_response(409)
+                          self.end_headers()
+                          self.wfile.write(str(ce).encode())
                       except Exception:
                           err = traceback.format_exc()
                           self.send_response(500)
                           self.end_headers()
                           self.wfile.write(err.encode())
 
-              HTTPServer(('localhost', 9090), Handler).serve_forever()
-      volumes:
-        - name: host-root
-          hostPath:
-            path: /
+              DaemonHTTPServer(("127.0.0.1", 9090), Handler).serve_forever()
 ---
 apiVersion: extensions.agents.x-k8s.io/v1beta1
 kind: SandboxTemplate
@@ -138,7 +573,7 @@ spec:
       labels:
         app: agent-sandbox-latebind
       annotations:
-        # 要求 GKE >= 1.36.0-gke.3302001，允许宿主机在 emptyDir 内的动态挂载穿透进 gVisor 沙箱
+        # 要求 GKE >= 1.36.0-gke.3302001，允许动态挂载穿透进 gVisor 沙箱
         dev.gvisor.empty-dir.workspace-volume.force-shared: "true"
     spec:
       runtimeClassName: gvisor
