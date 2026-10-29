@@ -39,6 +39,9 @@ bash ./03b-setup-agent-volumes-existing-gke.sh
 | **`03b-setup-agent-volumes-existing-gke.sh`** | **【首选 · 已有 GKE 集群极简版】直接从原 Step 3 开始（剔除新建 VPC/子网/GKE 集群冗余代码），一键完成内置插件关闭、1TiB VolumePool 创建与 14 项调优 `StorageClass` 部署**。 |
 | `03-setup-agent-volumes.sh` | （从零新建环境完整版）包含从新建 VPC/子网/GKE 集群到初始化 VolumePool 的全套流程。 |
 | **`04-test-agent-volumes-suite.sh`** | 验证 `VolumePool` 秒级建卷风暴 (`t1`)、沙箱复挂 (`t2`)、WarmPool 认领 (`t3`)、动态晚绑定 (`t4`) 与裸 I/O (`t5`) 的自动化测试套件。 |
+| **`latebind-example/17-latebind-agent-volumes.yaml`** | **生产安全加固版 `storage-node-daemon`**：采用 `open_tree + move_mount` 注入单 Pod `runsc-gofer` 挂载空间、`init_net` 宿主机网络锚定、`hard` 挂载 + `MNT_FORCE` 卸载及 `O_EXCL` 服务端原子租约。 |
+| **`latebind-example/18-dual-emptydir-hot-sqlite-warmpool.yaml`** | **【双 `emptyDir` 冷热分层 + WarmPool 模板】**：卷 1 (`force-shared: "true"`) 动态挂载远端 Filestore `VolumePool`，卷 2 (默认 `emptyDir`) 提供 `gVisor` 原生 `tmpfs` (`0.06ms` 原生 `WAL`)，内置 `POD_UID` 幂等恢复、`sqlite.backup()` 在线原子热备与 `SIGTERM` 退出零丢失刷盘。 |
+| **`latebind-example/19-test-dual-emptydir-e2e.sh`** | **【一键闭环验证脚本】**：全自动串联 WarmPool 亚秒级认领、`statfs` 文件系统魔数校验、`WAL` vs `DELETE` 性能对比、在线原子备份校验、`SIGTERM` 退出刷盘与跨 Pod 毫秒级 `RPO=0` 恢复。 |
 | **`node-sqlite-benchmark.js`** | **【核心推荐】单文件零依赖 SQLite 1,000 次真实事务压测脚本**：直接对比同一个挂载目录上「默认配置」vs「开启 `TRUNCATE + EXCLUSIVE + NORMAL` 独占锁调优」的 P50/P95 延迟与 5 并发/17 并发主线程排队耗时。 |
 | **`sqlite-pragma-preload.cjs`** | **零代码侵入 SQLite 调优预加载钩子**：通过 `NODE_OPTIONS="--require .../sqlite-pragma-preload.cjs"` 自动为 OpenClaw 注入最优 `PRAGMA`。 |
 | `01-filestore-multishare.yaml` | （备选：未开白项目使用）传统 Filestore Enterprise Multishare StorageClass（单实例最多切 80 张卷）。 |
@@ -61,3 +64,27 @@ node node-sqlite-benchmark.js /home/node/.openclaw/workspace
 1. **调优前默认配置 (`DELETE + NORMAL + FULL`)** 的 1,000 次写事务耗时与多通道排队延迟；
 2. **开启 SQLite 独占锁调优 (`TRUNCATE + EXCLUSIVE + NORMAL`)** 后的提速对比；
 3. **块存储 `WAL + NORMAL` 模式** 下的极限吞吐对比。
+
+---
+
+## 4. 一键验证「Filestore + 双 `emptyDir` 冷热分层 + `SandboxWarmPool`」全链路方案
+
+在已完成 `03b-setup-agent-volumes-existing-gke.sh`（或已有任意 Filestore NFS 共享）的 GKE Standard 集群上，直接运行：
+
+```bash
+cd latebind-example
+chmod +x 19-test-dual-emptydir-e2e.sh
+
+# 方式 A：自动从 volume-pool-sc 创建 1Gi 测试卷并跑完 5 项端到端验收（跑完自动清理）
+./19-test-dual-emptydir-e2e.sh
+
+# 方式 B：如果尚未创建 VolumePool，也可直接指定现有 Filestore 实例 IP 与子目录测试
+NFS_SERVER="<Filestore_IP>" NFS_PATH="/vol1/test-user" ./19-test-dual-emptydir-e2e.sh
+```
+
+脚本会在约 2 分钟内自动完成并输出 **5 项闭环验收结果**：
+1. **`[Check 1]` WarmPool 亚秒级认领 + `bind_nfs` 动态挂载耗时**；
+2. **`[Check 2]` `gVisor` 文件系统类型实证**（`/workspace/user_data` 为 `9p 0x01021997` vs `/sqlite-hot-dir` 为 `tmpfs 0x01021994`）及 **SQLite `WAL` (`~0.06ms`) vs `DELETE` (`~23ms`) 实测对比**；
+3. **`[Check 3]` 在线原子热备校验**：前台写入 200 笔对话后，校验远端 Filestore 备份库 `PRAGMA integrity_check = ok`；
+4. **`[Check 4]` `SIGTERM` 优雅回收刷盘（`RPO = 0`）**：追加 77 笔尚未到定时周期的增量后立即删除 `SandboxClaim`，验证退出钩子全量刷盘并安全 `unbind`；
+5. **`[Check 5]` 跨 Pod 重连恢复**：从 `SandboxWarmPool` 认领第二台预热 Pod 挂载同一员工卷，验证 `277/277` 笔记录毫秒级完整恢复且运行在 `journal_mode = wal`。

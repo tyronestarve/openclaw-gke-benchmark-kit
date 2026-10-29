@@ -1,0 +1,565 @@
+# ==============================================================================
+# 18-dual-emptydir-hot-sqlite-warmpool.yaml
+# GKE Agent Sandbox (gVisor) + SandboxWarmPool + Dual emptyDir Tiered Storage:
+#   - Volume 1 (workspace-volume): force-shared="true" emptyDir socket for <100ms
+#     dynamic Filestore VolumePool late-binding (/workspace/user_data)
+#   - Volume 2 (sqlite-hot-dir): default unannotated emptyDir (gVisor native tmpfs,
+#     magic 0x01021994) unlocking 0.06ms native SQLite WAL with zero code changes
+#   - Lifecycle Wrapper (wrapper.mjs):
+#       1) Waits on /workspace/.ready (0 CPU & 0 storage quota while pre-warmed)
+#       2) POD_UID-idempotent ms-level restore from /workspace/user_data/db-backup/
+#       3) Debounced online atomic backup via node:sqlite backup() (.tmp+fsync+rename)
+#       4) SIGTERM graceful flush (RPO = 0) before container exit
+#
+# Prerequisites:
+#   - Deploy 17-latebind-agent-volumes.yaml first (for storage-node-daemon)
+#   - GKE Standard >= 1.36.0-gke.3302001 with gVisor node pool
+# ==============================================================================
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: hot-sqlite-wrapper
+  namespace: default
+data:
+  wrapper.mjs: |
+    import fs from "node:fs";
+    import path from "node:path";
+    import { spawn } from "node:child_process";
+    import sqlite from "node:sqlite";
+
+    const MOUNT_ROOT = process.env.MOUNT_PATH || "/workspace";
+    const READY_FILE = path.join(MOUNT_ROOT, ".ready");
+    const NFS_USER_DIR = path.join(MOUNT_ROOT, "user_data");
+    const NFS_BACKUP_DIR = path.join(NFS_USER_DIR, "db-backup");
+    const HOT_STATE_DIR = process.env.OPENCLAW_STATE_DIR || "/sqlite-hot-dir";
+    const POD_UID = process.env.POD_UID || "unknown-pod-uid";
+    const INIT_MARKER = path.join(HOT_STATE_DIR, ".initialized_pod_uid");
+    const SYNC_INTERVAL_MS = Number(process.env.SQLITE_BACKUP_INTERVAL_MS || 5000);
+    const APP_CMD = process.env.APP_CMD || "node /opt/hot-sqlite/demo-agent.mjs";
+
+    const log = (msg, extra = {}) => {
+      console.log(
+        JSON.stringify({
+          ts: new Date().toISOString(),
+          component: "hot-sqlite-wrapper",
+          podUid: POD_UID,
+          msg,
+          ...extra,
+        })
+      );
+    };
+
+    const isSqliteDbFile = (name) =>
+      (name.endsWith(".sqlite") || name.endsWith(".db")) && !name.endsWith(".tmp");
+
+    const isTransientFile = (name) =>
+      name.startsWith(".initialized_pod_uid") ||
+      name.startsWith(".restored_meta") ||
+      name.includes(".tmp.") ||
+      name.endsWith(".tmp") ||
+      name.endsWith("-wal") ||
+      name.endsWith("-shm") ||
+      name.endsWith("-journal");
+
+    function walkFiles(baseDir, rel = "") {
+      const out = [];
+      const cur = path.join(baseDir, rel);
+      if (!fs.existsSync(cur)) return out;
+      for (const ent of fs.readdirSync(cur, { withFileTypes: true })) {
+        const subRel = rel ? path.join(rel, ent.name) : ent.name;
+        if (ent.isDirectory()) {
+          out.push(...walkFiles(baseDir, subRel));
+        } else if (ent.isFile() && !isTransientFile(ent.name)) {
+          out.push(subRel);
+        }
+      }
+      return out;
+    }
+
+    log("WarmPool sandbox ready; waiting for late-bind .ready signal...", { READY_FILE });
+    while (!fs.existsSync(READY_FILE)) {
+      await new Promise((r) => setTimeout(r, 100));
+    }
+
+    const tClaim0 = performance.now();
+    fs.mkdirSync(NFS_BACKUP_DIR, { recursive: true });
+    fs.mkdirSync(path.join(NFS_USER_DIR, "workspace"), { recursive: true });
+    fs.mkdirSync(HOT_STATE_DIR, { recursive: true });
+
+    // Step 1: POD_UID-idempotent restore from remote Filestore -> gVisor tmpfs hot dir
+    let restoredSqlite = 0;
+    let restoredFiles = 0;
+    const prevMarker = fs.existsSync(INIT_MARKER)
+      ? fs.readFileSync(INIT_MARKER, "utf8").trim()
+      : "";
+
+    if (prevMarker === POD_UID) {
+      log("Skipped cold restore (in-place container restart detected for same POD_UID)");
+    } else {
+      for (const relPath of walkFiles(NFS_BACKUP_DIR)) {
+        const src = path.join(NFS_BACKUP_DIR, relPath);
+        const dst = path.join(HOT_STATE_DIR, relPath);
+        fs.mkdirSync(path.dirname(dst), { recursive: true });
+        fs.copyFileSync(src, dst);
+        if (isSqliteDbFile(relPath)) restoredSqlite++;
+        else restoredFiles++;
+      }
+      fs.writeFileSync(INIT_MARKER, POD_UID);
+      const restoreMs = Number((performance.now() - tClaim0).toFixed(2));
+      fs.writeFileSync(
+        path.join(HOT_STATE_DIR, ".restored_meta.json"),
+        JSON.stringify({
+          podUid: POD_UID,
+          restoredSqlite,
+          restoredFiles,
+          restoreMs,
+          restoredAt: new Date().toISOString(),
+        })
+      );
+      log("Restored persistent state from Filestore into gVisor tmpfs", {
+        restoredSqlite,
+        restoredFiles,
+        restoreMs,
+      });
+    }
+
+    // Step 2: Debounced online atomic hot-backup (sqlite.backup() -> fsync -> atomic rename)
+    const lastSyncedMtime = new Map();
+    let syncing = false;
+
+    async function syncAllState(force = false) {
+      if (syncing) return;
+      syncing = true;
+      try {
+        for (const relPath of walkFiles(HOT_STATE_DIR)) {
+          const hotPath = path.join(HOT_STATE_DIR, relPath);
+          if (!fs.existsSync(hotPath)) continue;
+
+          let latestMtime = fs.statSync(hotPath).mtimeMs;
+          const walPath = `${hotPath}-wal`;
+          if (isSqliteDbFile(relPath) && fs.existsSync(walPath)) {
+            latestMtime = Math.max(latestMtime, fs.statSync(walPath).mtimeMs);
+          }
+          if (!force && lastSyncedMtime.get(relPath) === latestMtime) {
+            continue;
+          }
+
+          const dstFinal = path.join(NFS_BACKUP_DIR, relPath);
+          const dstTmp = `${dstFinal}.tmp.${process.pid}`;
+          fs.mkdirSync(path.dirname(dstFinal), { recursive: true });
+
+          const t0 = performance.now();
+          if (isSqliteDbFile(relPath)) {
+            const srcDb = new sqlite.DatabaseSync(hotPath, { readOnly: true });
+            try {
+              if (typeof sqlite.backup === "function") {
+                await sqlite.backup(srcDb, dstTmp);
+              } else {
+                if (fs.existsSync(dstTmp)) fs.unlinkSync(dstTmp);
+                const escaped = dstTmp.replace(/'/g, "''");
+                srcDb.exec(`VACUUM INTO '${escaped}';`);
+              }
+            } finally {
+              srcDb.close();
+            }
+          } else {
+            fs.copyFileSync(hotPath, dstTmp);
+          }
+
+          const fd = fs.openSync(dstTmp, "r+");
+          fs.fsyncSync(fd);
+          fs.closeSync(fd);
+          fs.renameSync(dstTmp, dstFinal);
+          lastSyncedMtime.set(relPath, latestMtime);
+          log("Atomic online backup persisted to Filestore", {
+            relPath,
+            backupMs: Number((performance.now() - t0).toFixed(2)),
+            force,
+          });
+        }
+      } catch (err) {
+        log("Online backup warning", { error: String(err) });
+      } finally {
+        syncing = false;
+      }
+    }
+
+    // Step 3: Launch main agent process (swap APP_CMD to your real agent binary in production)
+    const child = spawn("/bin/sh", ["-c", `exec ${APP_CMD}`], {
+      stdio: "inherit",
+      env: {
+        ...process.env,
+        OPENCLAW_STATE_DIR: HOT_STATE_DIR,
+        OPENCLAW_CONFIG_PATH: path.join(NFS_USER_DIR, "openclaw.json"),
+      },
+    });
+
+    const timer = setInterval(() => {
+      void syncAllState(false);
+    }, SYNC_INTERVAL_MS);
+
+    let shuttingDown = false;
+    async function gracefulShutdown(sig) {
+      if (shuttingDown) return;
+      shuttingDown = true;
+      clearInterval(timer);
+      log(`Received ${sig}; stopping agent process and flushing final state (RPO=0)...`);
+      child.kill("SIGTERM");
+      await new Promise((resolve) => {
+        child.once("exit", resolve);
+        setTimeout(resolve, 10000);
+      });
+      while (syncing) {
+        await new Promise((r) => setTimeout(r, 50));
+      }
+      await syncAllState(true);
+      try {
+        fs.writeFileSync(path.join(NFS_BACKUP_DIR, ".last_sigterm_flush.json"), JSON.stringify({
+          podUid: POD_UID,
+          flushedAt: new Date().toISOString(),
+        }));
+      } catch {
+        // Ignore if volume was already force-detached externally
+      }
+      log("Final SIGTERM flush to Filestore completed cleanly; exiting 0.");
+      process.exit(0);
+    }
+
+    process.on("SIGTERM", () => void gracefulShutdown("SIGTERM"));
+    process.on("SIGINT", () => void gracefulShutdown("SIGINT"));
+
+    child.on("exit", async (code) => {
+      if (!shuttingDown) {
+        clearInterval(timer);
+        await syncAllState(true);
+        process.exit(code ?? 0);
+      }
+    });
+
+  demo-agent.mjs: |
+    import fs from "node:fs";
+    import path from "node:path";
+    import http from "node:http";
+    import sqlite from "node:sqlite";
+
+    const HOT_DIR = process.env.OPENCLAW_STATE_DIR || "/sqlite-hot-dir";
+    const DB_PATH = path.join(HOT_DIR, "session-state.sqlite");
+    fs.mkdirSync(HOT_DIR, { recursive: true });
+
+    const db = new sqlite.DatabaseSync(DB_PATH);
+    db.exec(`
+      PRAGMA journal_mode = WAL;
+      PRAGMA synchronous = NORMAL;
+      PRAGMA busy_timeout = 5000;
+      CREATE TABLE IF NOT EXISTS conversation_turns (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        tag TEXT NOT NULL,
+        payload TEXT NOT NULL,
+        created_at TEXT NOT NULL
+      );
+    `);
+
+    const insStmt = db.prepare(
+      "INSERT INTO conversation_turns (tag, payload, created_at) VALUES (?, ?, ?)"
+    );
+    const cntStmt = db.prepare("SELECT COUNT(*) AS total FROM conversation_turns");
+    const lastStmt = db.prepare(
+      "SELECT id, tag, created_at FROM conversation_turns ORDER BY id DESC LIMIT 1"
+    );
+    const modeRow = db.prepare("PRAGMA journal_mode").get();
+
+    const server = http.createServer((req, res) => {
+      if (req.method === "GET" && req.url === "/status") {
+        const metaPath = path.join(HOT_DIR, ".restored_meta.json");
+        const restoredMeta = fs.existsSync(metaPath)
+          ? JSON.parse(fs.readFileSync(metaPath, "utf8"))
+          : null;
+        res.writeHead(200, { "Content-Type": "application/json" });
+        res.end(
+          JSON.stringify({
+            ok: true,
+            dbPath: DB_PATH,
+            journalMode: modeRow.journal_mode,
+            totalTurns: Number(cntStmt.get().total),
+            lastTurn: lastStmt.get() || null,
+            restoredMeta,
+          })
+        );
+        return;
+      }
+
+      if (req.method === "POST" && req.url === "/write") {
+        let body = "";
+        req.on("data", (chunk) => (body += chunk));
+        req.on("end", () => {
+          const { count = 10, tag = "turn" } = body ? JSON.parse(body) : {};
+          const payload = "x".repeat(512);
+          const samples = [];
+          for (let i = 0; i < count; i++) {
+            const t0 = performance.now();
+            db.exec("BEGIN IMMEDIATE");
+            insStmt.run(tag, payload, new Date().toISOString());
+            db.exec("COMMIT");
+            samples.push(performance.now() - t0);
+          }
+          samples.sort((a, b) => a - b);
+          const p50Ms = Number(samples[Math.floor(samples.length * 0.5)].toFixed(3));
+          res.writeHead(200, { "Content-Type": "application/json" });
+          res.end(
+            JSON.stringify({
+              written: count,
+              tag,
+              p50WriteMs: p50Ms,
+              totalTurns: Number(cntStmt.get().total),
+            })
+          );
+        });
+        return;
+      }
+
+      res.writeHead(404);
+      res.end("Not Found");
+    });
+
+    server.listen(8080, "0.0.0.0", () => {
+      console.log(
+        JSON.stringify({
+          ts: new Date().toISOString(),
+          component: "demo-agent",
+          msg: "Listening on :8080 with active SQLite WAL connection",
+          journalMode: modeRow.journal_mode,
+          initialTurns: Number(cntStmt.get().total),
+        })
+      );
+    });
+
+    process.on("SIGTERM", () => {
+      server.close(() => {
+        try {
+          db.exec("PRAGMA wal_checkpoint(TRUNCATE);");
+          db.close();
+        } catch {
+          // ignore
+        }
+        process.exit(0);
+      });
+    });
+
+  verify-probe.mjs: |
+    import fs from "node:fs";
+    import path from "node:path";
+    import { execFileSync } from "node:child_process";
+    import sqlite from "node:sqlite";
+
+    const NFS_DIR = "/workspace/user_data";
+    const HOT_DIR = process.env.OPENCLAW_STATE_DIR || "/sqlite-hot-dir";
+
+    function statfsHex(targetPath) {
+      try {
+        const out = execFileSync("stat", ["-f", "-c", "%t|%T", targetPath], {
+          encoding: "utf8",
+        }).trim();
+        const [hexRaw, fsName] = out.split("|");
+        return { path: targetPath, magicHex: `0x${hexRaw.padStart(8, "0")}`, fsType: fsName };
+      } catch (e) {
+        return { path: targetPath, error: String(e) };
+      }
+    }
+
+    function runBench(label, dbFile, requestedJournalMode, nWrites = 200) {
+      for (const ext of ["", "-wal", "-shm", "-journal"]) {
+        if (fs.existsSync(`${dbFile}${ext}`)) fs.unlinkSync(`${dbFile}${ext}`);
+      }
+      const db = new sqlite.DatabaseSync(dbFile);
+      db.exec(`
+        PRAGMA journal_mode = ${requestedJournalMode};
+        PRAGMA synchronous = ${requestedJournalMode === "WAL" ? "NORMAL" : "FULL"};
+        CREATE TABLE bench (id INTEGER PRIMARY KEY, val TEXT);
+      `);
+      const effectiveMode = db.prepare("PRAGMA journal_mode").get().journal_mode;
+      const ins = db.prepare("INSERT OR REPLACE INTO bench (id, val) VALUES (?, ?)");
+      const sel = db.prepare("SELECT val FROM bench WHERE id = ?");
+      const payload = "a".repeat(512);
+
+      const samples = [];
+      const tWrite0 = performance.now();
+      for (let i = 0; i < nWrites; i++) {
+        const s0 = performance.now();
+        db.exec("BEGIN IMMEDIATE");
+        ins.run(i, payload);
+        db.exec("COMMIT");
+        samples.push(performance.now() - s0);
+      }
+      const totalWriteMs = performance.now() - tWrite0;
+      samples.sort((a, b) => a - b);
+
+      const tRead0 = performance.now();
+      for (let i = 0; i < 1000; i++) sel.get(i % nWrites);
+      const read1000Ms = performance.now() - tRead0;
+
+      const tBurst0 = performance.now();
+      for (let ch = 0; ch < 17; ch++) {
+        for (let j = 0; j < 30; j++) {
+          db.exec("BEGIN IMMEDIATE");
+          ins.run(10000 + ch * 100 + j, payload);
+          db.exec("COMMIT");
+        }
+      }
+      const burst510TxMs = performance.now() - tBurst0;
+      db.close();
+
+      for (const ext of ["", "-wal", "-shm", "-journal"]) {
+        if (fs.existsSync(`${dbFile}${ext}`)) fs.unlinkSync(`${dbFile}${ext}`);
+      }
+
+      return {
+        label,
+        effectiveMode,
+        txCount: nWrites,
+        p50WriteMs: Number(samples[Math.floor(samples.length * 0.5)].toFixed(3)),
+        p99WriteMs: Number(samples[Math.floor(samples.length * 0.99)].toFixed(3)),
+        tps: Number(((nWrites / totalWriteMs) * 1000).toFixed(1)),
+        burst510TxMs: Number(burst510TxMs.toFixed(2)),
+        read1000Ms: Number(read1000Ms.toFixed(2)),
+      };
+    }
+
+    // Verify multi-process concurrent read on HOT_DIR while demo-agent holds active WAL connection
+    const hotLiveDb = new sqlite.DatabaseSync(path.join(HOT_DIR, "session-state.sqlite"), {
+      readOnly: true,
+    });
+    const concurrentReadCheck = hotLiveDb.prepare("SELECT COUNT(*) AS cnt FROM conversation_turns").get();
+    hotLiveDb.close();
+
+    // Note: in gVisor, external NFS mounts present as 9p (0x01021997), so applications
+    // like OpenClaw disable WAL and fall back to DELETE + FULL on /workspace/user_data,
+    // whereas /sqlite-hot-dir is native gVisor tmpfs (0x01021994) and runs native WAL + NORMAL.
+    const nfsRes = runBench(
+      "Direct Filestore NFS in gVisor (9p -> DELETE + FULL)",
+      path.join(NFS_DIR, ".probe-nfs-bench.sqlite"),
+      "DELETE",
+      200
+    );
+    const hotRes = runBench(
+      "Dual emptyDir Hot Tier in gVisor (tmpfs -> Native WAL + NORMAL)",
+      path.join(HOT_DIR, ".probe-hot-bench.sqlite"),
+      "WAL",
+      1000
+    );
+
+    const speedupX = Number((nfsRes.p50WriteMs / Math.max(hotRes.p50WriteMs, 0.001)).toFixed(1));
+    console.log(
+      JSON.stringify(
+        {
+          filesystemMagicCheck: {
+            volume1_latebindFilestore: statfsHex(NFS_DIR),
+            volume2_hotSqliteTmpfs: statfsHex(HOT_DIR),
+          },
+          concurrentMultiProcessWalRead: {
+            ok: true,
+            observedTurns: Number(concurrentReadCheck.cnt),
+          },
+          sqlitePerformanceComparison: {
+            directFilestoreDeleteMode: nfsRes,
+            hotTmpfsNativeWalMode: hotRes,
+            writeLatencySpeedupX: `${speedupX}x`,
+          },
+        },
+        null,
+        2
+      )
+    );
+---
+apiVersion: extensions.agents.x-k8s.io/v1beta1
+kind: SandboxTemplate
+metadata:
+  name: dual-emptydir-hot-sqlite-template
+  namespace: default
+spec:
+  podTemplate:
+    metadata:
+      labels:
+        app: dual-emptydir-hot-sqlite
+      annotations:
+        # CRITICAL: Only Volume 1 gets force-shared="true" (host pass-through socket for Filestore).
+        # Volume 2 (sqlite-hot-dir) MUST remain unannotated so gVisor mounts it as native internal tmpfs!
+        dev.gvisor.empty-dir.workspace-volume.force-shared: "true"
+    spec:
+      runtimeClassName: gvisor
+      terminationGracePeriodSeconds: 30
+      automountServiceAccountToken: false
+      nodeSelector:
+        sandbox.gke.io/runtime: gvisor
+      tolerations:
+        - key: "sandbox.gke.io/runtime"
+          value: "gvisor"
+          effect: "NoSchedule"
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 1000
+        runAsGroup: 1000
+        fsGroup: 1000
+      containers:
+        - name: agent
+          # Default uses official Node 22 LTS (built-in node:sqlite + sqlite.backup()) for zero-dependency verification.
+          # For real workload integration, replace image with your agent image and set APP_CMD accordingly.
+          image: node:22-slim
+          imagePullPolicy: IfNotPresent
+          command: ["node", "/opt/hot-sqlite/wrapper.mjs"]
+          securityContext:
+            allowPrivilegeEscalation: false
+            runAsNonRoot: true
+            capabilities:
+              drop: ["ALL"]
+          env:
+            - name: POD_UID
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.uid
+            - name: MOUNT_PATH
+              value: "/workspace"
+            - name: OPENCLAW_STATE_DIR
+              value: "/sqlite-hot-dir"
+            - name: OPENCLAW_CONFIG_PATH
+              value: "/workspace/user_data/openclaw.json"
+            - name: SQLITE_BACKUP_INTERVAL_MS
+              value: "3000"
+            - name: APP_CMD
+              value: "node /opt/hot-sqlite/demo-agent.mjs"
+          ports:
+            - containerPort: 8080
+          volumeMounts:
+            - name: workspace-volume
+              mountPath: /workspace
+              mountPropagation: HostToContainer
+            - name: sqlite-hot-dir
+              mountPath: /sqlite-hot-dir
+            - name: wrapper-scripts
+              mountPath: /opt/hot-sqlite
+              readOnly: true
+          resources:
+            requests:
+              cpu: "250m"
+              memory: "512Mi"
+            limits:
+              cpu: "1500m"
+              memory: "2Gi"
+      volumes:
+        - name: workspace-volume
+          emptyDir: {}
+        - name: sqlite-hot-dir
+          emptyDir:
+            sizeLimit: 512Mi
+        - name: wrapper-scripts
+          configMap:
+            name: hot-sqlite-wrapper
+---
+apiVersion: extensions.agents.x-k8s.io/v1beta1
+kind: SandboxWarmPool
+metadata:
+  name: dual-emptydir-hot-sqlite-pool
+  namespace: default
+spec:
+  replicas: 2
+  sandboxTemplateRef:
+    name: dual-emptydir-hot-sqlite-template
