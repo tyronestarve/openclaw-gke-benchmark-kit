@@ -1,5 +1,9 @@
 # Dynamic Storage Late-Binding for GKE Sandbox Warm Pools
 
+> 📖 **中文架构设计与一键验证指南（Chinese Architecture & Verification Guide）**：
+> - **[《GKE Agent Sandbox 高性能存储方案：Filestore 与双 emptyDir 冷热分层及 WarmPool 协同设计》](./ARCHITECTURE_CN.md)**（含完整架构图、Sample YAML、四阶段生命周期拆解与真机压测数据对比）
+> - 一键全链路验收脚本：[`./19-test-dual-emptydir-e2e.sh`](./19-test-dual-emptydir-e2e.sh)
+
 Agents generally use one of three file storage access modes:
 
 - **Private Isolated Workspaces:** An agent starts up with a private isolated storage directory it has sole read/write access to.

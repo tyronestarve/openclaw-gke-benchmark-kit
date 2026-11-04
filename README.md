@@ -14,7 +14,7 @@
 | 目录 | 模块定位 | 核心交付物与用途 |
 | :--- | :--- | :--- |
 | **[`01-sandbox-deploy/`](./01-sandbox-deploy/)** | **沙箱底座与四级弹性部署** | 包含 GKE Standard / Autopilot 的 `SandboxTemplate`、`SandboxWarmPool`、`CapacityBuffer`（Active/Standby）YAML 清单及生命周期计时脚本 `pocfn.sh`。 |
-| **[`02-filestore-sqlite-benchmark/`](./02-filestore-sqlite-benchmark/)** | **Filestore 与 SQLite 专项压测** | 包含 Filestore Multishare / Agent Volumes 部署脚本、Node.js `fsync` 1000×1KB 小文件基准脚本、1~17 飞书通道并发 SQLite 压测脚本及一键评测 Runner。 |
+| **[`02-filestore-sqlite-benchmark/`](./02-filestore-sqlite-benchmark/)** | **Filestore 与 SQLite 专项压测及双 `emptyDir` 冷热分层架构** | 包含 **[《GKE Agent Sandbox 高性能存储方案：Filestore 与双 emptyDir 冷热分层及 WarmPool 协同设计》](./02-filestore-sqlite-benchmark/latebind-example/ARCHITECTURE_CN.md)**、一键 E2E 验收脚本 [`19-test-dual-emptydir-e2e.sh`](./02-filestore-sqlite-benchmark/latebind-example/19-test-dual-emptydir-e2e.sh)、Filestore Multishare / Agent Volumes 部署脚本及 1~17 飞书通道并发 SQLite 压测脚本。 |
 | **[`03-cost-and-sizing-guide/`](./03-cost-and-sizing-guide/)** | **性能评估标准与 TCO 成本模型** | 提供存储分层选型红线指标（4 大监控阈值）、Filestore 1TiB 保底分摊与 80/20 混合存储成本公式、以及计算层潮汐休眠 TCO 测算方法。 |
 | **[`04-sandbox-portal/`](./04-sandbox-portal/)** | **可视化运营与成本推演控制台** | FastAPI + ECharts 沙箱管理门户源码（支持本地免集群离线启动体验），内置实时 SQLite 监控、一键热升配演练剧本及交互式成本模拟器。 |
 
