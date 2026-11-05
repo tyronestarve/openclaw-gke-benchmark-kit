@@ -23,21 +23,40 @@
 
 ## 二、Filestore 与双 `emptyDir` 是如何配合的？（目录物理映射与分工）
 
-理解本方案最关键的一点，是看清容器内部看到的两个目录（`/sqlite-hot-dir` 与 `/workspace`）背后对应的**真实物理存储位置**，以及为什么「备份写向卷 1 子目录」实际上是直接落盘到了远端的 Filestore 企业级存储阵列中：
+理解本方案最关键的一点，是看清容器内部看到的两个目录（`/home/node/.openclaw` 与 `/workspace`）背后对应的**真实物理存储位置**，以及为什么「备份写向卷 1 子目录」实际上是直接落盘到了远端的 Filestore 企业级存储阵列中：
 
 ![Filestore 与双 emptyDir 物理映射及配合关系图](./assets/fig-1-volumes-coop.png)
+
+> [!NOTE]
+> 示意图中的内存盘挂载点沿用早期名称 `/sqlite-hot-dir`。当前版本将内存盘**直接挂载在业务原有的 `/home/node/.openclaw`**，`OPENCLAW_STATE_DIR` 与 `openclaw.json` 保持不变，原理完全相同。
 
 如上图所示，两个 `emptyDir` 在 `gVisor` 沙箱内扮演着截然不同但高度互补的角色：
 
 | 存储层名称 | 容器内挂载路径 | K8s / gVisor 配置特征 | 底层真实物理介质 | 承担的业务职责 |
 | :--- | :--- | :--- | :--- | :--- |
-| **卷 1：持久层插座底座**<br>(`workspace-volume`) | `/workspace`<br>（认领后子目录为 `/workspace/user_data`） | 声明 `force-shared: "true"` 注解 + `HostToContainer` 挂载传播 | `/workspace` 外壳是宿主机目录门框；**里面的 `/workspace/user_data` 在认领后物理上已是远端 Filestore `VolumePool` 磁盘** | 1. 实时读写员工的工程代码、文档等工作区文件<br>2. 在 `user_data/db-backup/` 下持久化保存完整的 `.sqlite` 备份库与 `openclaw.json` 配置 |
-| **卷 2：极速热读写层**<br>(`sqlite-hot-dir`) | `/sqlite-hot-dir` | 普通默认 `emptyDir: {}`（**不加 `force-shared` 注解**，设置 `sizeLimit` 内存保护上限） | **gVisor 沙箱内核自管的纯内存文件系统（`tmpfs`，魔数 `0x01021994`）**，宿主机不可见 | 承接 `t-claw` 运行期的全部高频 SQLite 状态读写（通过官方环境变量 `OPENCLAW_STATE_DIR=/sqlite-hot-dir` 定向，无需软链接或改源码） |
+| **卷 1：持久层插座底座**<br>(`workspace-volume`) | `/workspace`<br>（认领后子目录为 `/workspace/user_data`） | 声明 `force-shared: "true"` 注解 + `HostToContainer` 挂载传播 | `/workspace` 外壳是宿主机目录门框；**里面的 `/workspace/user_data` 在认领后物理上已是远端 Filestore `VolumePool` 磁盘** | 1. 存放员工原 `/home/node/.openclaw` 的全部内容（目录结构不变）<br>2. `workspace*`、`agents/<id>/sessions`、`media`、`browser` 等大文件/日志目录通过软链接直接读写此处<br>3. 保存 `.sqlite` 与 `openclaw.json` 的持久化副本 |
+| **卷 2：极速热读写层**<br>(`sqlite-hot-dir`) | `/home/node/.openclaw`（业务原有目录） | 普通默认 `emptyDir: {}`（**不加 `force-shared` 注解**，设置 `sizeLimit` 内存保护上限） | **gVisor 沙箱内核自管的纯内存文件系统（`tmpfs`，魔数 `0x01021994`）**，宿主机不可见 | 承接 `t-claw` 运行期的全部高频 SQLite 读写；`OPENCLAW_STATE_DIR=/home/node/.openclaw` 保持不变，无需改源码或重新构建镜像 |
 
 ### 关键细节澄清：为什么要加 `force-shared: "true"`？为什么备份不会丢在本地临时目录里？
 
 * **为什么卷 1 必须加 `force-shared: "true"`**：默认情况下，`gVisor` 为了隔离安全，会把 `emptyDir` 封闭在沙箱自己的虚拟内核内存里，宿主机完全看不见，也无法从宿主机往里面挂载新的 NFS 卷。加上 `dev.gvisor.empty-dir.workspace-volume.force-shared: "true"` 注解后，等于在沙箱墙上开了一个连接宿主机的「透传插座」，使得宿主机上的挂载管家（`storage-node-daemon`）在员工认领 Pod 时挂载的远端 Filestore `VolumePool`，能够瞬间穿透进正在运行的沙箱内部。
-* **为什么备份写到 `/workspace/user_data/db-backup/` 是持久化的**：`/workspace` 第一层目录确实只是一个空的门框，但它的子目录 **`/workspace/user_data/` 已经被挂载成了远端真正的 Filestore 存储卷**。因此，当热备脚本把 SQLite 快照写入 `/workspace/user_data/db-backup/` 时，数据已经跨过网络真正落盘到了远端的 Google Cloud Filestore 存储集群硬盘上——哪怕下一秒当前 GKE 计算节点整机断电报废，远端 Filestore 里的备份数据依然完好无损。
+* **为什么写到 `/workspace/user_data/` 是持久化的**：`/workspace` 第一层目录确实只是一个空的门框，但它的子目录 **`/workspace/user_data/` 已经被挂载成了远端真正的 Filestore 存储卷**。因此，当热备脚本把 SQLite 快照写入 `/workspace/user_data/` 时，数据已经跨过网络真正落盘到了远端的 Google Cloud Filestore 存储集群硬盘上——哪怕下一秒当前 GKE 计算节点整机断电报废，远端 Filestore 里的备份数据依然完好无损。
+
+
+### 冷热分流：哪些进内存盘、哪些通过软链接留在 Filestore
+
+启动包装器 `wrapper.mjs`（通过 ConfigMap 挂载，**无需重新构建镜像**）在拉起业务进程前完成分流。业务看到的路径全部仍是 `/home/node/.openclaw/...`：
+
+| 业务访问路径（保持不变） | 容器内形态 | 物理位置 |
+| :--- | :--- | :--- |
+| `state/openclaw.sqlite`、`agents/<id>/agent/*.sqlite`、`memory/`、`flows/`、`tasks/` 等 SQLite 与 `openclaw.json` 等轻量文件 | 实体文件 | **内存盘 `tmpfs`（原生 WAL）**，变更后原子备份回 Filestore |
+| `workspace`、`workspace-<agentId>` | 软链接 → `/workspace/user_data/...` | **Filestore** |
+| `agents/<id>/sessions`（`*.jsonl` / `*.trajectory.jsonl`）及 `agents/<id>/` 下除 `agent/` 外的其他子目录 | 软链接 → `/workspace/user_data/...` | **Filestore** |
+| `browser`、`media`、`delivery-queue-media`、`logs`、`.local` | 软链接 → `/workspace/user_data/...` | **Filestore** |
+| `*.tmp-*`、`*.backup-*`、`*.legacy-bak`、`*.migrated`（历史升级/崩溃残留） | 不恢复、不同步 | 留在 Filestore 原处 |
+
+> [!IMPORTANT]
+> 请**不要**在 `openclaw.json` 中配置 `session.store` 来迁移 sessions：OpenClaw 会依据 `session.store` 推导 Agent SQLite 的路径，导致 SQLite 一并落到 Filestore。sessions 的分流统一由上述软链接完成。
 
 ### 部署与使用示例（Sample YAML 与四步实操流程）
 
@@ -45,7 +64,7 @@
 
 #### 1. 预热池与双 `emptyDir` 模板声明（`openclaw-warmpool.yaml`）
 
-注意核心细节：**仅对 `workspace-volume` 添加 `force-shared: "true"` 注解**，而 `sqlite-hot-dir` 保持默认不加注解（使其在 `gVisor` 内生成原生高速 `tmpfs`），并通过 `OPENCLAW_STATE_DIR` 环境变量零侵入定向 SQLite 状态目录：
+注意核心细节：**仅对 `workspace-volume` 添加 `force-shared: "true"` 注解**，而 `sqlite-hot-dir` 保持默认不加注解（使其在 `gVisor` 内生成原生高速 `tmpfs`），并**直接挂载在业务原有的 `/home/node/.openclaw`**（完整可执行版本见 [`18-dual-emptydir-hot-sqlite-warmpool.yaml`](./18-dual-emptydir-hot-sqlite-warmpool.yaml)）：
 
 ```yaml
 apiVersion: extensions.agents.x-k8s.io/v1beta1
@@ -77,7 +96,7 @@ spec:
       containers:
         - name: openclaw
           image: ghcr.io/openclaw/openclaw:2026.9.1
-          command: ["node", "/opt/openclaw-wrapper/wrapper.mjs"]
+          command: ["node", "/opt/hot-sqlite/wrapper.mjs"]
           securityContext:
             allowPrivilegeEscalation: false
             capabilities:
@@ -87,37 +106,41 @@ spec:
               valueFrom:
                 fieldRef:
                   fieldPath: metadata.uid
-            - name: OPENCLAW_STATE_DIR
-              value: "/sqlite-hot-dir"
+            - name: OPENCLAW_STATE_DIR          # 保持业务原有路径不变
+              value: "/home/node/.openclaw"
             - name: OPENCLAW_CONFIG_PATH
-              value: "/workspace/user_data/openclaw.json"
-            - name: SQLITE_BACKUP_INTERVAL_MS
-              value: "5000"
+              value: "/home/node/.openclaw/openclaw.json"
+            - name: OPENCLAW_WORKSPACE_DIR
+              value: "/home/node/.openclaw/workspace"
+            - name: HOT_LIMIT_MB                # 与 sqlite-hot-dir 的 sizeLimit 一致
+              value: "1024"
+            - name: APP_CMD                     # 业务镜像原有的启动命令
+              value: "node openclaw.mjs gateway --bind lan --port 18789"
           volumeMounts:
             - name: workspace-volume
               mountPath: /workspace
               mountPropagation: HostToContainer
             - name: sqlite-hot-dir
-              mountPath: /sqlite-hot-dir
-            - name: wrapper-script
-              mountPath: /opt/openclaw-wrapper
+              mountPath: /home/node/.openclaw   # 内存盘直接挂在原目录上
+            - name: wrapper-scripts
+              mountPath: /opt/hot-sqlite
               readOnly: true
           resources:
             requests:
               cpu: "250m"
-              memory: "512Mi"
+              memory: "1Gi"
             limits:
-              cpu: "1500m"
-              memory: "2Gi"
+              cpu: "2"
+              memory: "3Gi"
       volumes:
         - name: workspace-volume
           emptyDir: {}
         - name: sqlite-hot-dir
           emptyDir:
-            sizeLimit: 512Mi
-        - name: wrapper-script
+            sizeLimit: 1Gi
+        - name: wrapper-scripts
           configMap:
-            name: openclaw-hot-sqlite-wrapper
+            name: hot-sqlite-wrapper
 ---
 apiVersion: extensions.agents.x-k8s.io/v1beta1
 kind: SandboxWarmPool
@@ -163,15 +186,15 @@ curl -sS -X POST http://127.0.0.1:9090 \
   }'
 ```
 
-4. **会话闲置回收与优雅刷盘（删除 `SandboxClaim` + 调用 `unbind`）**：会话结束时删除 `SandboxClaim`，容器收到 `SIGTERM` 后自动将 `/sqlite-hot-dir` 最新数据全量原子刷回 `/workspace/user_data/db-backup/`；随后控制面调用节点守护进程的 `{"action": "unbind", ...}` 卸载 NFS 卷并移除 Finalizer，完成无残留回收。
+4. **会话闲置回收与优雅刷盘（删除 `SandboxClaim` + 调用 `unbind`）**：会话结束时删除 `SandboxClaim`，容器收到 `SIGTERM` 后自动将内存盘中最新的 SQLite 与状态文件原子刷回 `/workspace/user_data/`；随后控制面调用节点守护进程的 `{"action": "unbind", ...}` 卸载 NFS 卷并移除 Finalizer，完成无残留回收。
 
 #### 3. 配套开源验证清单与一键实测脚本
 
 完整的可执行部署清单、`wrapper.mjs` 热备包装器与一键自动化验收脚本位于当前目录（[`02-filestore-sqlite-benchmark/latebind-example`](./)）：
 
 * **[`17-latebind-agent-volumes.yaml`](./17-latebind-agent-volumes.yaml)**：生产安全加固版 `storage-node-daemon`（`runsc-gofer` 独立挂载空间注入、`hard` 挂载 + `MNT_FORCE` 卸载、`O_EXCL` 服务端原子租约）。
-* **[`18-dual-emptydir-hot-sqlite-warmpool.yaml`](./18-dual-emptydir-hot-sqlite-warmpool.yaml)**：双 `emptyDir` 冷热分层 `SandboxTemplate`、`SandboxWarmPool` 及内置 `POD_UID` 幂等恢复、`sqlite.backup()` 在线热备与 `SIGTERM` 优雅刷盘包装器。
-* **[`19-test-dual-emptydir-e2e.sh`](./19-test-dual-emptydir-e2e.sh)**：零外部依赖一键闭环验收脚本（约 2 分钟跑完预热认领、`statfs` 魔数校验、`WAL` vs `DELETE` 实测跑分、在线热备完整性校验、`SIGTERM` 退出零丢失刷盘及跨 Pod 毫秒级重连恢复）：
+* **[`18-dual-emptydir-hot-sqlite-warmpool.yaml`](./18-dual-emptydir-hot-sqlite-warmpool.yaml)**：双 `emptyDir` 冷热分层 `SandboxTemplate`、`SandboxWarmPool` 及启动包装器（内存盘挂载于 `/home/node/.openclaw`；冷目录软链分流、`POD_UID` 幂等恢复、`sqlite.backup()` 在线热备、80% 容量保护与 `SIGTERM` 优雅刷盘）。
+* **[`19-test-dual-emptydir-e2e.sh`](./19-test-dual-emptydir-e2e.sh)**：零外部依赖一键闭环验收脚本（使用原版 OpenClaw 镜像跑完预热认领与晚绑定、`tmpfs`/WAL/软链分流验收、在线热备完整性校验、`SIGTERM` 退出零丢失刷盘及跨 Pod 恢复）：
 
 ```bash
 git clone https://github.com/tyronestarve/openclaw-gke-benchmark-kit.git
@@ -188,22 +211,22 @@ cd openclaw-gke-benchmark-kit/02-filestore-sqlite-benchmark/latebind-example
 ![与 SandboxWarmPool 结合的四阶段全生命周期流程图](./assets/fig-2-warmpool-flow.png)
 
 ### 阶段一：WarmPool 预热待命（员工尚未上线）
-`SandboxWarmPool` 提前在节点池上拉起一批已完成 `gVisor` 内核与基础容器初始化的空白 Pod。此时还没有分配具体员工，`/workspace` 与 `/sqlite-hot-dir` 均为空目录，容器内的启动脚本停在轻量级等待 `/workspace/.ready` 信号文件的状态，0 CPU 消耗，也不占用任何员工存储配额。
+`SandboxWarmPool` 提前在节点池上拉起一批已完成 `gVisor` 内核与基础容器初始化的空白 Pod。此时还没有分配具体员工，`/workspace` 与 `/home/node/.openclaw` 均为空目录，容器内的启动脚本停在轻量级等待 `/workspace/.ready` 信号文件的状态，0 CPU 消耗，也不占用任何员工存储配额。
 
 ### 阶段二：员工认领瞬间 —— 亚秒级晚绑定与热库恢复
 1. **动态挂载专属 Filestore 卷**：调度控制面从 WarmPool 锁定一台待命 Pod，通知该节点的 `storage-node-daemon` 将该员工专属的 Filestore `VolumePool` 挂载到沙箱的 `/workspace/user_data` 目录（`< 100 ms`），随后写入 `/workspace/.ready` 就绪信号。
-2. **毫秒级灌入高速热盘**：容器内的启动脚本检测到 `.ready` 信号后立即苏醒，检查当前 `POD_UID` 初始化标记（防止容器进程原地异常重启时误用旧备份覆盖内存新数据），把远端 Filestore（`/workspace/user_data/db-backup/`）里的历史 `.sqlite` 及状态文件拷贝到高速内存盘 `/sqlite-hot-dir/`（几 MB 至几十 MB 数据库仅需数毫秒）。
-3. **启动热备协程与 `t-claw`**：后台拉起轻量级增量热备同步器，随后通过环境变量 `OPENCLAW_STATE_DIR=/sqlite-hot-dir` 和 `OPENCLAW_CONFIG_PATH=/workspace/user_data/openclaw.json` 正式拉起 `t-claw` 主进程对外服务。
+2. **毫秒级灌入高速热盘**：容器内的启动脚本检测到 `.ready` 信号后立即苏醒，检查当前 `POD_UID` 初始化标记（防止容器进程原地异常重启时误用旧备份覆盖内存新数据），把远端 Filestore（`/workspace/user_data/`）里的 `.sqlite` 及轻量状态文件拷贝到内存盘 `/home/node/.openclaw/`（几 MB 至几百 MB 仅需数十毫秒至数秒），并为 `workspace*`、`agents/<id>/sessions`、`media` 等大文件目录建立指向 Filestore 的同名软链接。
+3. **启动热备协程与 `t-claw`**：后台拉起轻量级增量热备同步器，随后以原有的 `OPENCLAW_STATE_DIR=/home/node/.openclaw` 正式拉起 `t-claw` 主进程对外服务（目录结构与配置均不变）。
 
 ### 阶段三：对话运行期 —— 前台微秒级读写 + 后台按需在线原子热备
-* **前台零阻塞交互**：员工对话期间，`t-claw` 对会话上下文、工具状态的所有 SQLite 读写全部发生在 `/sqlite-hot-dir`（`tmpfs`）上，完全不经过网络。
-* **后台无感增量持久化**：后台同步器定期（默认每 5 秒，可通过 `SQLITE_BACKUP_INTERVAL_MS` 配置）监测 `/sqlite-hot-dir` 下数据库及 `-wal` 文件的修改时间（以及非 SQLite 凭据文件的实时变更）：
+* **前台零阻塞交互**：员工对话期间，`t-claw` 对会话上下文、工具状态的所有 SQLite 读写全部发生在 `/home/node/.openclaw`（`tmpfs`）上，完全不经过网络；sessions 日志与工作区大文件则经软链接直接读写 Filestore。
+* **后台无感增量持久化**：后台同步器监听文件变更（500 ms 合并，持续写入时最长 5 秒必同步，可通过 `SYNC_DEBOUNCE_MS` / `SYNC_MAX_INTERVAL_MS` 配置），监测内存盘中数据库及 `-wal` 文件的修改时间（以及非 SQLite 凭据文件的实时变更）：
   * **空闲期零开销**：员工没有发消息、文件未变化时，同步器不做任何操作，**0 网络与 Filestore IO 开销**。
   * **写入期在线原子备份**：注意在 `WAL` 模式下最新数据位于 `-wal` 日志中，直接用普通文件 `cp` 可能拷到未合并完的脏页。因此同步器调用 Node 原生内置的 **SQLite 在线热备接口（`sqlite.backup()`）**，在不锁表、不打断前台 `t-claw` 读写的前提下，将合并了最新 `-wal` 的完整一致镜像先写入远端 Filestore 的临时文件 `xxx.sqlite.tmp`，执行 `fsync` 确保物理落盘后，再通过原子 `rename` 覆盖正式的 `xxx.sqlite` 备份文件。即便备份中途断电，远端 Filestore 上的正式备份库也永远 100% 完整可用（`PRAGMA integrity_check = ok`）。
 
 ### 阶段四：会话结束或缩容回收 —— 优雅刷盘实现跨节点无缝重连
 1. Kubernetes 向容器发送 `SIGTERM` 退出信号，`t-claw` 执行自带的优雅关闭逻辑，自动执行 `TRUNCATE` Checkpoint 将 `-wal` 中的全部数据刷回主数据库文件并关闭连接。
-2. 退出钩子紧接着将 `/sqlite-hot-dir` 中的最终完整状态执行最后一次全量原子同步落盘到 `/workspace/user_data/db-backup/`（耗时仅约 25 至 70 毫秒），实现 **正常退出 100% 零数据丢失（`RPO = 0`）**。
+2. 退出钩子紧接着将内存盘中的最终完整状态执行最后一次原子同步落盘到 `/workspace/user_data/`（实测数百毫秒内完成），实现 **正常退出 100% 零数据丢失（`RPO = 0`）**。
 3. 控制面调用 `unbind` 卸载存储并销毁旧 Pod。该员工下次再来时，无论被调度到哪台新节点的 WarmPool 预热 Pod，都能从 Filestore 瞬间恢复最后一秒的完整记忆。
 
 ---
@@ -240,10 +263,18 @@ cd openclaw-gke-benchmark-kit/02-filestore-sqlite-benchmark/latebind-example
 | :--- | :--- | :--- | :--- |
 | **是否支持 `SandboxWarmPool` 预热池** | **✅ 支持**（亚秒级动态挂载） | **✅ 支持**（亚秒级挂载 + 毫秒级灌库） | **❌ 不支持**（块设备无法动态挂入运行中 Pod） |
 | **单机高密度（如 88 Pod/节点）与池化省钱** | **✅ 支持** | **✅ 支持**（热盘通过 `sizeLimit` 控内存上限） | **❌ 受限**（受节点挂载数上限与预分配容量限制） |
-| **是否需要修改 `t-claw` 源码** | 不需要 | **不需要**（仅配官方 `OPENCLAW_STATE_DIR` 环境变量） | 不需要 |
+| **是否需要修改 `t-claw` 源码 / 重新构建镜像** | 不需要 | **不需要**（`OPENCLAW_STATE_DIR` 保持原路径，包装器经 ConfigMap 挂载） | 不需要 |
 | **`gVisor` 内单笔 SQLite 写延迟** | `23.3 ms`（`DELETE` 模式） | **`0.06 ms`**（原生 `WAL` 模式） | `1.5 ~ 3.0 ms`（在 `gVisor` 内同样呈 `9p` 走 `DELETE` 模式） |
 | **日常缩容 / 发版 / 空闲回收是否丢数据** | **0 丢失（`RPO = 0`）** | **0 丢失（`RPO = 0`，`SIGTERM` 退出全量刷回 Filestore）** | **0 丢失（`RPO = 0`）** |
 | **整台宿主机突发硬断电（未走 `SIGTERM`）** | **0 丢失（实时落盘远端 NFS）** | 历史备份 **100% 完好不损坏**；仅可能丢失距离上次定时热备（最后几秒内）未同步的极少量对话增量 | **0 丢失（实时落盘块设备）** |
+
+### 运维注意：容器原地重启后需要重新调用 `bind_nfs`
+
+晚绑定的 Filestore 挂载注入在容器对应的 `runsc-gofer` 挂载命名空间中。业务进程崩溃或 OOM 导致**容器原地重启**（Pod 不变、`restartCount` 增加）后，新容器看不到原来的挂载。此时：
+
+* 启动包装器会**等待** `/workspace/user_data` 重新可写（每 10 秒输出一次 `Waiting for Filestore mount to become writable` 日志），不会退出；内存盘（`emptyDir`）随 Pod 保留，数据不会丢失。
+* 控制面对该 Pod 再次调用 `bind_nfs`（带 `force_rebind: true`）后，包装器识别为原地重启，**先把内存盘中的最新数据刷回 Filestore，再启动业务进程**（实测：重新绑定后 325 ms 完成刷回，崩溃前写入的数据完整保留）。
+* 建议控制面监听 Pod 的 `restartCount` 变化，自动重新调用 `bind_nfs`。
 
 ### 最终落地选型建议
 

@@ -84,7 +84,7 @@ NFS_SERVER="<Filestore_IP>" NFS_PATH="/vol1/test-user" ./19-test-dual-emptydir-e
 
 脚本会在约 2 分钟内自动完成并输出 **5 项闭环验收结果**：
 1. **`[Check 1]` WarmPool 亚秒级认领 + `bind_nfs` 动态挂载耗时**；
-2. **`[Check 2]` `gVisor` 文件系统类型实证**（`/workspace/user_data` 为 `9p 0x01021997` vs `/sqlite-hot-dir` 为 `tmpfs 0x01021994`）及 **SQLite `WAL` (`~0.06ms`) vs `DELETE` (`~23ms`) 实测对比**；
+2. **`[Check 2]` 客户验收项**：`/home/node/.openclaw` 为 `tmpfs`、`/workspace/user_data` 为 Filestore（`v9fs`），SQLite 自动进入 `WAL`（出现 `-wal` / `-shm`），`workspace`、`media`、`agents/<id>/sessions` 均为指向 Filestore 的软链接；
 3. **`[Check 3]` 在线原子热备校验**：前台写入 200 笔对话后，校验远端 Filestore 备份库 `PRAGMA integrity_check = ok`；
 4. **`[Check 4]` `SIGTERM` 优雅回收刷盘（`RPO = 0`）**：追加 77 笔尚未到定时周期的增量后立即删除 `SandboxClaim`，验证退出钩子全量刷盘并安全 `unbind`；
 5. **`[Check 5]` 跨 Pod 重连恢复**：从 `SandboxWarmPool` 认领第二台预热 Pod 挂载同一员工卷，验证 `277/277` 笔记录毫秒级完整恢复且运行在 `journal_mode = wal`。

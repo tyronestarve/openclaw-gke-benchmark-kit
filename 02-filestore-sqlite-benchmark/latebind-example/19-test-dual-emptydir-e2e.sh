@@ -5,13 +5,15 @@
 #   Filestore (VolumePool / NFS) + Dual emptyDir (force-shared + gVisor tmpfs)
 #   + SandboxWarmPool + Online Atomic sqlite.backup() + SIGTERM RPO=0 Restore
 #
-# Verifies 5 closed-loop assertions on GKE Standard (gVisor):
-#   [1] WarmPool sub-second claim + storage-node-daemon bind_nfs injection
-#   [2] gVisor statfs magic check (9p 0x01021997 vs tmpfs 0x01021994) &
-#       SQLite native WAL (~0.06ms) vs direct NFS DELETE (~15-23ms) benchmark
-#   [3] Online atomic sqlite.backup() to remote Filestore (integrity_check=ok)
-#   [4] SIGTERM graceful flush (RPO=0 for un-synced in-flight turns) + unbind
-#   [5] Cross-Pod WarmPool claim #2 restoring 100% of turns in milliseconds
+# Verifies 5 closed-loop assertions on GKE Standard (gVisor), using the real
+# OpenClaw gateway image with the tmpfs memory disk mounted directly at
+# /home/node/.openclaw (OPENCLAW_STATE_DIR unchanged):
+#   [1] WarmPool claim + storage-node-daemon bind_nfs injection (/workspace/user_data)
+#   [2] Customer acceptance: tmpfs vs v9fs mounts, SQLite WAL (-wal/-shm), and
+#       sessions / workspace* / media symlinked to Filestore (memory usage via du)
+#   [3] Online atomic sqlite.backup() of the agent DB to Filestore (integrity_check=ok)
+#   [4] SIGTERM graceful flush (RPO=0 for a just-written row) + unbind
+#   [5] Cross-Pod WarmPool claim #2 restoring all rows into tmpfs WAL
 #
 # Usage:
 #   # Mode A: Automatic VolumePool PVC provisioning (default: SC=volume-pool-sc)
@@ -94,7 +96,7 @@ daemon_for_node() {
 call_daemon_api() {
   local daemon_pod="$1"
   local json_payload="$2"
-  kubectl exec -n "$NS" "$daemon_pod" -c daemon -- python3 - "$json_payload" <<'PY'
+  kubectl exec -i -n "$NS" "$daemon_pod" -c daemon -- python3 - "$json_payload" <<'PY'
 import sys, urllib.request, urllib.error
 
 payload = sys.argv[1].encode()
@@ -195,7 +197,9 @@ if ! kubectl get ds storage-node-daemon -n "$NS" >/dev/null 2>&1; then
 fi
 kubectl rollout status ds/storage-node-daemon -n "$NS" --timeout=180s
 
-sed "s|extensions.agents.x-k8s.io/v1beta1|extensions.agents.x-k8s.io/${API_VER}|g; s|namespace: default|namespace: ${NS}|g" \
+# Test-only: give the gateway an auth token (production supplies its own env / secrets)
+sed -e "s|extensions.agents.x-k8s.io/v1beta1|extensions.agents.x-k8s.io/${API_VER}|g; s|namespace: default|namespace: ${NS}|g" \
+    -e 's|            - name: APP_CMD|            - name: OPENCLAW_GATEWAY_TOKEN\n              value: "e2e-test-token-0123456789"\n            - name: APP_CMD|' \
   "$WARMPOOL_YAML" | kubectl apply -f -
 
 echo "Waiting for 2 pre-warmed gVisor sandboxes in dual-emptydir-hot-sqlite-pool..."
@@ -230,6 +234,28 @@ EOF
   TARGET_NFS_PATH="/$(kubectl get pv "$PV_NAME" -o jsonpath='{.spec.csi.volumeAttributes.volume}')"
   echo "✅ Provisioned VolumePool share: ${TARGET_NFS_IP}:${TARGET_NFS_PATH}"
 fi
+
+seed_employee_volume() {
+  # Real employee volumes already contain /home/node/.openclaw content incl. openclaw.json.
+  # The E2E volume starts empty, so write a minimal config (only if absent) via a short-lived Pod.
+  local vol_json
+  if [ -n "${NFS_SERVER:-}" ] && [ -n "${NFS_PATH:-}" ]; then
+    vol_json="{\"name\":\"v\",\"nfs\":{\"server\":\"${TARGET_NFS_IP}\",\"path\":\"${TARGET_NFS_PATH}\"}}"
+  else
+    vol_json="{\"name\":\"v\",\"persistentVolumeClaim\":{\"claimName\":\"${TEST_PVC}\"}}"
+  fi
+  kubectl delete pod dual-e2e-seed -n "$NS" --ignore-not-found --wait=true >/dev/null 2>&1 || true
+  kubectl run dual-e2e-seed -n "$NS" --restart=Never --image=busybox:1.36 --overrides="{
+    \"spec\":{\"securityContext\":{\"runAsUser\":1000,\"runAsGroup\":1000},
+      \"containers\":[{\"name\":\"seed\",\"image\":\"busybox:1.36\",
+        \"command\":[\"sh\",\"-c\",\"[ -f /v/openclaw.json ] || echo '{\\\"gateway\\\":{\\\"mode\\\":\\\"local\\\"}}' > /v/openclaw.json; ls -la /v\"],
+        \"volumeMounts\":[{\"name\":\"v\",\"mountPath\":\"/v\"}]}],
+      \"volumes\":[${vol_json}]}}" >/dev/null
+  kubectl wait --for=jsonpath='{.status.phase}'=Succeeded pod/dual-e2e-seed -n "$NS" --timeout=120s >/dev/null
+  kubectl delete pod dual-e2e-seed -n "$NS" --wait=false >/dev/null 2>&1 || true
+  echo "✅ Employee volume seeded with a minimal openclaw.json (gateway.mode=local)"
+}
+seed_employee_volume
 
 create_claim_manifest() {
   local cname="$1"
@@ -288,54 +314,79 @@ echo "  Pod #1       : ${POD1} (Node: ${POD1_NODE})"
 echo "  Claim Latency: $((T_C1_CLAIMED - T_C1_START)) ms | Late-Bind RPC: $((T_BIND1_DONE - T_BIND1_START)) ms"
 echo "  Daemon Reply : ${BIND1_OUT}"
 
-for _ in $(seq 1 40); do
-  if kubectl exec -n "$NS" "$POD1" -- node -e \
-    "fetch('http://127.0.0.1:8080/status').then(r=>r.ok?process.exit(0):process.exit(1)).catch(()=>process.exit(1))" 2>/dev/null; then
-    break
-  fi
-  sleep 0.25
-done
+wait_gateway_ready() {
+  local pod="$1"
+  for _ in $(seq 1 120); do
+    if kubectl logs -n "$NS" "$pod" -c openclaw 2>/dev/null | grep -q "\[gateway\] ready"; then
+      return 0
+    fi
+    sleep 1
+  done
+  echo "ERROR: gateway in ${pod} did not become ready" >&2
+  kubectl logs -n "$NS" "$pod" -c openclaw --tail=40 >&2 || true
+  exit 1
+}
 
-echo ""
-echo "--- [Check 2] gVisor statfs Magic & SQLite WAL vs DELETE Benchmark ---"
-kubectl exec -n "$NS" "$POD1" -- node /opt/hot-sqlite/verify-probe.mjs
-
-echo ""
-echo "--- [Check 3] Writing 200 Turns + Verifying Online Atomic sqlite.backup() ---"
-kubectl exec -n "$NS" "$POD1" -- node --input-type=module -e "
-const r = await fetch('http://127.0.0.1:8080/write', {
-  method: 'POST',
-  body: JSON.stringify({ count: 200, tag: 'online-batch-1' })
-});
-console.log('  Foreground WAL Write (200 turns):', await r.text());
-"
-echo "  Waiting 4.2s for background 3s debounced sqlite.backup() to flush to Filestore..."
-sleep 4.2
-
-kubectl exec -n "$NS" "$POD1" -- node --input-type=module -e "
+agent_sql() {
+  # $1=pod  $2=db path  $3=readOnly(true|false)  $4=JS body using `db`
+  kubectl exec -n "$NS" "$1" -c openclaw -- node --input-type=module -e "
 import sqlite from 'node:sqlite';
-const db = new sqlite.DatabaseSync('/workspace/user_data/db-backup/session-state.sqlite', { readOnly: true });
-const chk = db.prepare('PRAGMA integrity_check').get();
-const cnt = db.prepare('SELECT COUNT(*) AS c FROM conversation_turns').get();
+const db = new sqlite.DatabaseSync('$2', { readOnly: $3 });
+$4
 db.close();
-console.log('  Remote Filestore Backup Check -> integrity:', chk.integrity_check, '| persisted turns:', Number(cnt.c));
-if (chk.integrity_check !== 'ok' || Number(cnt.c) !== 200) process.exit(1);
+"
+}
+
+HOT=/home/node/.openclaw
+# OpenClaw creates and owns the shared state DB at startup (WAL on tmpfs); per-agent DBs are created lazily
+HOT_DB="${HOT}/state/openclaw.sqlite"
+NFS_DB="/workspace/user_data/state/openclaw.sqlite"
+
+wait_gateway_ready "$POD1"
+
+echo ""
+echo "--- [Check 2] Customer Acceptance: tmpfs / WAL / symlinked cold dirs ---"
+kubectl exec -n "$NS" "$POD1" -c openclaw -- sh -c "
+stat -f -c '%n -> %T' ${HOT} ${HOT}/state /workspace/user_data
+ls -lh ${HOT}/state/
+ls -ld ${HOT}/workspace ${HOT}/media ${HOT}/agents/main/sessions
+du -sh ${HOT}
+"
+kubectl exec -n "$NS" "$POD1" -c openclaw -- sh -c "
+[ \"\$(stat -f -c %T ${HOT})\" = tmpfs ] || { echo 'FAIL: ${HOT} is not tmpfs'; exit 1; }
+[ -e ${HOT}/state/openclaw.sqlite-wal ] || { echo 'FAIL: state DB is not in WAL mode'; exit 1; }
+for d in workspace media agents/main/sessions; do [ -L ${HOT}/\$d ] || { echo \"FAIL: \$d is not a symlink\"; exit 1; }; done
+echo '  ✅ tmpfs + WAL + symlinked cold dirs verified'
 "
 
 echo ""
-echo "--- [Check 4] Writing 77 Un-Synced Turns + Triggering SIGTERM RPO=0 Teardown ---"
-kubectl exec -n "$NS" "$POD1" -- node --input-type=module -e "
-const r = await fetch('http://127.0.0.1:8080/write', {
-  method: 'POST',
-  body: JSON.stringify({ count: 77, tag: 'sigterm-final-delta' })
-});
-console.log('  Pre-SIGTERM Delta Write (+77 = 277 total):', await r.text());
+echo "--- [Check 3] Writing 200 rows + Verifying Online Atomic sqlite.backup() ---"
+agent_sql "$POD1" "$HOT_DB" false "
+db.exec('CREATE TABLE IF NOT EXISTS e2e_turns (id INTEGER PRIMARY KEY, tag TEXT)');
+const ins = db.prepare('INSERT INTO e2e_turns (tag) VALUES (?)');
+for (let i = 0; i < 200; i++) ins.run('online-batch-1');
+console.log('  journal_mode =', db.prepare('PRAGMA journal_mode').get().journal_mode);
+"
+echo "  Waiting 3s for debounced sqlite.backup() to flush to Filestore..."
+sleep 3
+agent_sql "$POD1" "$NFS_DB" true "
+const chk = db.prepare('PRAGMA integrity_check').get().integrity_check;
+const cnt = Number(db.prepare('SELECT COUNT(*) AS c FROM e2e_turns').get().c);
+console.log('  Remote Filestore Backup Check -> integrity:', chk, '| persisted rows:', cnt);
+if (chk !== 'ok' || cnt !== 200) process.exit(1);
+"
+
+echo ""
+echo "--- [Check 4] Writing 77 Un-Synced Rows + Triggering SIGTERM RPO=0 Teardown ---"
+agent_sql "$POD1" "$HOT_DB" false "
+const ins = db.prepare('INSERT INTO e2e_turns (tag) VALUES (?)');
+for (let i = 0; i < 77; i++) ins.run('sigterm-final-delta');
 "
 unbind_and_release_claim "dual-e2e-claim-1" "$POD1" "$POD1_UID" "$POD1_NODE"
 echo "  ✅ Pod #1 gracefully flushed on SIGTERM, unbound from Filestore, and terminated cleanly."
 
 echo ""
-echo "--- [Check 5] Claiming WarmPool Pod #2 & Verifying Millisecond RPO=0 Restore ---"
+echo "--- [Check 5] Claiming WarmPool Pod #2 & Verifying RPO=0 Restore ---"
 create_claim_manifest "dual-e2e-claim-2" | kubectl apply -f - >/dev/null
 POD2=$(wait_claim_pod "dual-e2e-claim-2")
 kubectl patch pod "$POD2" -n "$NS" --type=merge \
@@ -353,25 +404,14 @@ call_daemon_api "$DAEMON2" "{
   \"nfs_path\": \"${TARGET_NFS_PATH}\"
 }" >/dev/null
 
-STATUS_POD2=""
-for _ in $(seq 1 40); do
-  STATUS_POD2=$(kubectl exec -n "$NS" "$POD2" -- node -e \
-    "fetch('http://127.0.0.1:8080/status').then(r=>r.text()).then(t=>{console.log(t);process.exit(0)}).catch(()=>process.exit(1))" 2>/dev/null || true)
-  if [ -n "$STATUS_POD2" ]; then
-    break
-  fi
-  sleep 0.25
-done
-
-echo "  Pod #2 (${POD2} on ${POD2_NODE}) Restored Status:"
-echo "  ${STATUS_POD2}"
-
-python3 - "$STATUS_POD2" <<'PY'
-import json, sys
-data = json.loads(sys.argv[1])
-assert data["journalMode"].lower() == "wal", f"Expected WAL, got {data['journalMode']}"
-assert data["totalTurns"] == 277, f"Expected 277 restored turns (RPO=0), got {data['totalTurns']}"
-assert data["lastTurn"]["tag"] == "sigterm-final-delta", f"Unexpected lastTurn: {data['lastTurn']}"
-restore_ms = data["restoredMeta"]["restoreMs"]
-print(f"\n🎉 ALL 5 E2E CHECKS PASSED! Restored 277/277 turns (RPO=0) into gVisor tmpfs WAL in {restore_ms} ms.")
-PY
+wait_gateway_ready "$POD2"
+kubectl logs -n "$NS" "$POD2" -c openclaw | grep "Restored hot state" || true
+agent_sql "$POD2" "$HOT_DB" true "
+const mode = db.prepare('PRAGMA journal_mode').get().journal_mode;
+const total = Number(db.prepare('SELECT COUNT(*) AS c FROM e2e_turns').get().c);
+const last = db.prepare('SELECT tag FROM e2e_turns ORDER BY id DESC LIMIT 1').get().tag;
+console.log('  Pod #2 restored -> journal_mode:', mode, '| rows:', total, '| last tag:', last);
+if (mode !== 'wal' || total !== 277 || last !== 'sigterm-final-delta') process.exit(1);
+"
+echo ""
+echo "🎉 ALL 5 E2E CHECKS PASSED! 277/277 rows restored (RPO=0) into gVisor tmpfs WAL at ${HOT}."
