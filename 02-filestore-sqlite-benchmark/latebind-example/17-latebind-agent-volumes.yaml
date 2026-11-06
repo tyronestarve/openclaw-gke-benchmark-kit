@@ -361,6 +361,23 @@ spec:
                       if res.returncode == 0:
                           return opts
                       last_err = res.stderr.strip() or f"rc={res.returncode}"
+                      if not is_ro and "No such file or directory" in last_err and ":" in source:
+                          srv, full_p = source.split(":", 1)
+                          parts = [p for p in full_p.split("/") if p]
+                          if len(parts) >= 2:
+                              root_src = f"{srv}:/{parts[0]}"
+                              sub_rel = "/".join(parts[1:])
+                              r0 = subprocess.run(["mount", "-t", "nfs", "-o", opts, root_src, target_dir], capture_output=True, text=True, timeout=MOUNT_TIMEOUT_SEC)
+                              if r0.returncode == 0:
+                                  try:
+                                      sub_abs = safe_join(target_dir, sub_rel)
+                                      os.makedirs(sub_abs, exist_ok=True)
+                                      os.chown(sub_abs, 1000, 1000)
+                                  finally:
+                                      libc.umount2(target_dir.encode(), MNT_FORCE | MNT_DETACH)
+                                  r1 = subprocess.run(["mount", "-t", "nfs", "-o", opts, source, target_dir], capture_output=True, text=True, timeout=MOUNT_TIMEOUT_SEC)
+                                  if r1.returncode == 0:
+                                      return opts
                   raise RuntimeError(f"All mount.nfs option sets failed for {source}: {last_err}")
 
               class DaemonHTTPServer(ThreadingHTTPServer):

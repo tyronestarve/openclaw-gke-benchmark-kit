@@ -1,0 +1,56 @@
+# ==============================================================================
+# 20-normal-filestore-pvc.yaml
+# 普通 Filestore (Basic HDD / Standard 1Ti) StorageClass 与独立 PVC 清单
+#
+# 适用场景：
+#   当项目尚未开通 Filestore Agent Volumes (VolumePool) 白名单（或预览期结束等待 GA）时，
+#   使用无需任何白名单的普通 Filestore 实例，配合 17-latebind-agent-volumes.yaml 与
+#   18-dual-emptydir-hot-sqlite-warmpool.yaml 完成 WarmPool 晚绑定与双 emptyDir 热缓验证。
+#
+# 注意事项：
+#   1. 请将下方 parameters.network 修改为您 GKE 集群所在的实际 VPC 网络名称。
+#   2. volumeBindingMode 必须设为 Immediate（因为晚绑定模式下 PVC 独立创建，不在 Pod spec.volumes 中静态声明）。
+#   3. 普通 Filestore (tier: standard) 最小容量为 1Ti，首次创建需等待约 5-8 分钟变为 Bound；
+#      变为 Bound 后，可通过子目录切片（如 /vol1/emp-001, /vol1/emp-002）供多台沙箱 0.2s 晚绑定复用。
+#   4. 测试完毕后执行 kubectl delete pvc manual-pvc-normal-1 即可自动销毁底层 Filestore 实例并停止计费。
+# ==============================================================================
+apiVersion: storage.k8s.io/v1
+kind: StorageClass
+metadata:
+  name: normal-filestore-sc
+provisioner: filestore.csi.storage.gke.io
+parameters:
+  tier: standard
+  network: default   # <--- 请替换为您 GKE 集群所在的 VPC 名称（如非 default）
+mountOptions:
+  - vers=3
+  - proto=tcp
+  - mountproto=tcp
+  - port=2049
+  - mountport=2050
+  - nocto
+  - noatime
+  - nodiratime
+  - actimeo=600
+  - lookupcache=all
+  - nconnect=8
+  - rsize=1048576
+  - wsize=1048576
+  - local_lock=all
+  - async
+volumeBindingMode: Immediate
+reclaimPolicy: Delete
+allowVolumeExpansion: true
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: manual-pvc-normal-1
+  namespace: default
+spec:
+  accessModes:
+    - ReadWriteMany
+  storageClassName: normal-filestore-sc
+  resources:
+    requests:
+      storage: 1Ti
