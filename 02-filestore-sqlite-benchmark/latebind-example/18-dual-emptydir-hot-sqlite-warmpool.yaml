@@ -279,6 +279,13 @@ data:
     }
     fs.writeFileSync(META_FILE, JSON.stringify(meta));
 
+    // 新员工首次绑定空白子目录时，若尚无 openclaw.json 则自动初始化最小配置，防止 gateway 因缺配置退出
+    const hotCfg = path.join(HOT_DIR, "openclaw.json");
+    if (!fs.existsSync(hotCfg)) {
+      fs.writeFileSync(hotCfg, JSON.stringify({ gateway: { mode: "local" } }, null, 2));
+      log("Initialized default openclaw.json for new empty workspace", { hotCfg });
+    }
+
     // 顶层冷目录软链：固定列表 + Filestore 上已有的 workspace-* / backup*
     const coldTopSet = new Set(FIXED_COLD_TOP_DIRS);
     for (const ent of fs.readdirSync(COLD_ROOT, { withFileTypes: true })) {

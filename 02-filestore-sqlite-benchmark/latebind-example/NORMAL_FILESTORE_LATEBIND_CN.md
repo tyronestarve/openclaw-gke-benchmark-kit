@@ -49,14 +49,17 @@ echo "Share Path:   /$(kubectl get pv "$PV_NAME" -o jsonpath='{.spec.csi.volumeA
 
 ---
 
-### Step 2：部署晚绑定 DaemonSet 与双 `emptyDir` 预热池（如已部署可跳过）
+### Step 2：部署晚绑定 DaemonSet 与双 `emptyDir` 预热池
+
+> **重要提示**：即使之前已部署过 `17` 和 `18`，也建议重新执行一次 `kubectl apply` 以加载最新的**普通 Filestore 子目录自动创建**与**新员工空卷默认 `openclaw.json` 初始化**增强逻辑。
 
 ```bash
 kubectl apply -f 17-latebind-agent-volumes.yaml
 kubectl apply -f 18-dual-emptydir-hot-sqlite-warmpool.yaml
 
-# 确认 storage-node-daemon 与预热池 Pod 就绪
+# 若之前已运行过旧版 DaemonSet / WarmPool，重建一下预热池 Pod 以挂载最新 ConfigMap
 kubectl rollout status ds/storage-node-daemon
+kubectl delete pods -l app=dual-emptydir-hot-sqlite --ignore-not-found
 kubectl get pods -l app=dual-emptydir-hot-sqlite
 ```
 
@@ -64,11 +67,18 @@ kubectl get pods -l app=dual-emptydir-hot-sqlite
 
 ### Step 3：创建 `SandboxClaim` 秒级认领沙箱，并执行 `0.2s` 晚绑定
 
-#### 3.1 认领一台预热沙箱（以员工 `18652181` 为例）
+#### 3.1 认领一台预热沙箱（以员工 `18652181` 为例，自动兼容 `v1alpha1` / `v1beta1` CRD）
 
 ```bash
 EMP_ID="18652181"
 CLAIM_NAME="claim-${EMP_ID}"
+
+# 自动检测集群当前安装的 Agent Sandbox CRD 使用 warmPoolRef 还是 sandboxTemplateRef
+if kubectl explain sandboxclaim.spec 2>/dev/null | grep -q "warmPoolRef"; then
+  SPEC_BLOCK="warmPoolRef: { name: dual-emptydir-hot-sqlite-pool }"
+else
+  SPEC_BLOCK="sandboxTemplateRef: { name: dual-emptydir-hot-sqlite-template }"
+fi
 
 kubectl apply -f - <<EOF
 apiVersion: extensions.agents.x-k8s.io/v1beta1
@@ -77,22 +87,31 @@ metadata:
   name: ${CLAIM_NAME}
   namespace: default
 spec:
-  sandboxTemplateRef:
-    name: dual-emptydir-hot-sqlite-template
+  ${SPEC_BLOCK}
 EOF
 
 # 获取认领出来的 Sandbox Pod 名称
-POD_NAME=$(kubectl get sandboxclaim "$CLAIM_NAME" -o jsonpath='{.status.sandbox.Name}{.status.sandbox.name}')
+SB_NAME=$(kubectl get sandboxclaim "$CLAIM_NAME" -o jsonpath='{.status.sandbox.Name}{.status.sandbox.name}')
+if kubectl get pod "$SB_NAME" >/dev/null 2>&1; then
+  POD_NAME="$SB_NAME"
+else
+  POD_NAME=$(kubectl get pod -l "agents.x-k8s.io/sandbox-name=${SB_NAME}" -o jsonpath='{.items[0].metadata.name}')
+fi
 echo "Claimed Sandbox Pod: ${POD_NAME}"
 ```
 
 #### 3.2 执行晚绑定（自动从 `manual-pvc-normal-1` 提取 IP 并按员工工号切片挂载）
 
-直接复制运行以下脚本（脚本会自动在普通 Filestore 的 `/vol1` 下为该员工创建独立子目录 `/vol1/emp-${EMP_ID}` 并挂载进沙箱的 `/workspace/user_data`）：
+直接复制运行以下脚本（`storage-node-daemon` 会自动在普通 Filestore 的 `/vol1` 下为该员工创建独立子目录 `/vol1/emp-${EMP_ID}` 并挂载进沙箱的 `/workspace/user_data`）：
 
 ```bash
 EMP_ID="18652181"
-POD_NAME=$(kubectl get sandboxclaim "claim-${EMP_ID}" -o jsonpath='{.status.sandbox.Name}{.status.sandbox.name}')
+SB_NAME=$(kubectl get sandboxclaim "claim-${EMP_ID}" -o jsonpath='{.status.sandbox.Name}{.status.sandbox.name}')
+if kubectl get pod "$SB_NAME" >/dev/null 2>&1; then
+  POD_NAME="$SB_NAME"
+else
+  POD_NAME=$(kubectl get pod -l "agents.x-k8s.io/sandbox-name=${SB_NAME}" -o jsonpath='{.items[0].metadata.name}')
+fi
 PVC_NAME="manual-pvc-normal-1"
 NS="default"
 
@@ -109,21 +128,9 @@ NFS_SHARE="${NFS_ROOT}/emp-${EMP_ID}"
 
 echo "Binding ${NFS_IP}:${NFS_SHARE} -> Pod ${POD_NAME} (${POD_UID}) via ${DAEMON_POD}..."
 
-# 2. 确保员工子目录存在并调用 storage-node-daemon 完成 0.2s 晚绑定
+# 2. 调用 storage-node-daemon 完成子目录自动初始化与 0.2s 晚绑定
 kubectl exec -i -n "$NS" "$DAEMON_POD" -c daemon -- python3 - <<EOF
-import json, os, subprocess, tempfile, urllib.request
-
-# 若员工子目录尚未创建，先在临时挂载点自动初始化目录与权限 (1000:1000)
-tmp_mnt = tempfile.mkdtemp(prefix="init_emp_")
-try:
-    subprocess.run(["mount", "-t", "nfs", "-o", "vers=3,proto=tcp,nolock", "${NFS_IP}:${NFS_ROOT}", tmp_mnt], check=True)
-    emp_dir = os.path.join(tmp_mnt, "emp-${EMP_ID}")
-    os.makedirs(emp_dir, exist_ok=True)
-    os.chown(emp_dir, 1000, 1000)
-finally:
-    subprocess.run(["umount", "-l", tmp_mnt], check=False)
-    os.rmdir(tmp_mnt)
-
+import json, urllib.request
 req = urllib.request.Request(
     "http://127.0.0.1:9090",
     data=json.dumps({
