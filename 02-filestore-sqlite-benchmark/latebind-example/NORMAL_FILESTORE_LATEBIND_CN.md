@@ -152,7 +152,9 @@ kubectl label pod "$POD_NAME" -n "$NS" latebind-pvc="${PVC_NAME}" --overwrite
 ```bash
 kubectl logs "$POD_NAME" --tail=30
 ```
-看到 `"Restored hot state from Filestore"` 与 `"Started main process"` 即表示热缓恢复与 OpenClaw 启动成功。
+看到 `"Restored hot state from Filestore"` 与 `"Started main process"`，随后出现 `[gateway] ready`，即表示热缓恢复与 OpenClaw 启动成功。
+
+> **排错提示（实测踩坑）**：若 `kubectl logs` 中反复出现 `Waiting for Filestore mount to become writable`，且 `kubectl get pod` 显示 `RESTARTS` 持续增加，请先 `kubectl logs "$POD_NAME" -p` 查看上一次容器退出原因。最常见的是 OpenClaw 以 `exit 78` 退出：`Refusing to bind gateway to lan without auth`（空白新卷上没有带 `gateway.auth.token` 的 `openclaw.json`）。容器一旦重启，`runsc-gofer` 会被重建，之前注入的 NFS 挂载随之丢失，需要重新执行 `3.2` 的 `bind_nfs`。最新版 `18-dual-emptydir-hot-sqlite-warmpool.yaml` 已在空卷首次启动时自动生成带随机 `gateway.auth.token` 的最小 `openclaw.json`（也可通过 `OPENCLAW_GATEWAY_TOKEN` 环境变量指定），请确保 Step 2 已 `kubectl apply` 最新版本并重建预热池 Pod。
 
 ---
 

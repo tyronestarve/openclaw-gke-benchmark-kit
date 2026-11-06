@@ -30,6 +30,7 @@ data:
     import path from "node:path";
     import os from "node:os";
     import { spawn } from "node:child_process";
+    import { randomBytes } from "node:crypto";
     import sqlite from "node:sqlite";
 
     const MOUNT_ROOT      = process.env.MOUNT_PATH || "/workspace";
@@ -279,11 +280,14 @@ data:
     }
     fs.writeFileSync(META_FILE, JSON.stringify(meta));
 
-    // 新员工首次绑定空白子目录时，若尚无 openclaw.json 则自动初始化最小配置，防止 gateway 因缺配置退出
+    // 新员工首次绑定空白子目录时，若尚无 openclaw.json 则自动初始化最小配置，防止 gateway 因缺配置退出。
+    // 注意：`gateway --bind lan` 在无 auth 时会以 exit 78 拒绝启动（"Refusing to bind gateway to lan without auth"），
+    // 容器随之重启、runsc-gofer 重建、晚绑定挂载丢失。因此这里必须同时生成 gateway.auth.token。
     const hotCfg = path.join(HOT_DIR, "openclaw.json");
     if (!fs.existsSync(hotCfg)) {
-      fs.writeFileSync(hotCfg, JSON.stringify({ gateway: { mode: "local" } }, null, 2));
-      log("Initialized default openclaw.json for new empty workspace", { hotCfg });
+      const token = process.env.OPENCLAW_GATEWAY_TOKEN || randomBytes(24).toString("hex");
+      fs.writeFileSync(hotCfg, JSON.stringify({ gateway: { mode: "local", auth: { mode: "token", token } } }, null, 2), { mode: 0o600 });
+      log("Initialized default openclaw.json (gateway.mode=local + auth.token) for new empty workspace", { hotCfg, tokenSource: process.env.OPENCLAW_GATEWAY_TOKEN ? "env" : "generated" });
     }
 
     // 顶层冷目录软链：固定列表 + Filestore 上已有的 workspace-* / backup*
