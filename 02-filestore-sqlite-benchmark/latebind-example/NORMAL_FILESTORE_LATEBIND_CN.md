@@ -6,11 +6,14 @@
 
 ## 一、核心疑问解答（FAQ）
 
-### 1. 普通 Filestore 最小容量 1TB 贵吗？多个员工的“切片（Slicing）”在哪里做？
-* **PoC 测试成本极低**：普通 `Basic HDD`（`tier: standard`）最小容量为 `1Ti`，单价为 `$0.16 / GB / 月`（按小时计费，**每小时仅约 `$0.22` / 约 1.6 元人民币**）。测试完执行 `kubectl delete pvc` 即刻自动销毁底层实例并停止计费。
-* **多员工切片方式（子目录切片 vs VolumePool 切片）**：
-  * **`VolumePool`（需白名单，预计下周 GA）**：在 **K8s PVC 层**切片，1TB 池子可切出上千张独立的 `20Gi` 小 PVC。
-  * **普通 Filestore（无需白名单，本指南方案）**：在 **NFS 目录层**切片。整个集群只需创建 **1 张** `1Ti` 的总 PVC（例如 `manual-pvc-normal-1`，对应共享目录 `/vol1`），在晚绑定时按员工工号传入子目录（如 `/vol1/emp-001`、`/vol1/emp-002`），每个员工的沙箱只挂载自己专属的子目录，互不干扰。
+### 1. 普通 Filestore 最小容量 1TB 贵吗？和 VolumePool 切片有什么区别？容器内路径对应关系是什么？
+* **PoC 测试成本极低**：普通 `Basic HDD`（`tier: standard`）最小容量为 `1Ti`，单价为 `$0.16 / GB / 月`（按小时计费，**每小时仅约 `$0.22` / 约 1.6 元人民币**）。测试完执行 `kubectl delete pvc manual-pvc-normal-1` 即刻自动销毁底层 Filestore 实例并停止计费。
+* **与 `VolumePool` 的区别**：
+  * **`VolumePool`（需白名单，预计下周 GA）**：在 **K8s PVC 层**自动切片，1TB 池子可按需切出多张独立的 `20Gi` 小 PVC。
+  * **普通 Filestore（无需白名单，本指南方案）**：申请 `manual-pvc-normal-1` 时直接创建 1 台独立的 `1Ti` Filestore 实例（在 PV 中的共享名为 `/vol1`），**昨天的晚绑定脚本一行都不用改逻辑**，只需把 `PVC_NAME` 换成 `"manual-pvc-normal-1"` 即可直接挂载验证（若需在一张普通 PVC 上隔离多个员工，也可在 `NFS_SHARE` 后追加子目录）。
+* **容器内 OpenClaw（龙虾）目录与挂载路径对应关系**：
+  * **`/home/node/.openclaw`（容器内 OpenClaw 主目录 / `tmpfs` 内存热盘）**：对应 `sqlite-hot-dir`（`emptyDir`），存放 `openclaw.json`、热态 `SQLite/WAL` 数据库及运行态文件。
+  * **`/workspace/user_data`（容器内 Filestore 晚绑定挂载点）**：`storage-node-daemon` 将 Filestore PVC 的共享目录（`/vol1`）直接挂载到容器内的 `/workspace/user_data`。`wrapper.mjs` 会自动在 `/home/node/.openclaw` 与 `/workspace/user_data` 之间同步热状态并建立冷数据软链（`workspace`、`agents/<id>/sessions`、`media`、`logs` 等）。
 
 ### 2. Filestore 创建后的 IP 在哪里？为什么晚绑定要读 IP，而普通挂载不用？
 * **IP 在哪里**：当 K8s 的 `PVC` 变为 `Bound` 后，Filestore CSI 驱动会自动把分配好的内网 IP 写入对应 `PV`（PersistentVolume）对象的 `.spec.csi.volumeAttributes.ip` 字段中，脚本直接通过 `kubectl get pv` 自动读取，无需人工去控制台查找。
@@ -100,35 +103,28 @@ fi
 echo "Claimed Sandbox Pod: ${POD_NAME}"
 ```
 
-#### 3.2 执行晚绑定（自动从 `manual-pvc-normal-1` 提取 IP 并按员工工号切片挂载）
+#### 3.2 执行晚绑定（与昨天脚本 100% 一致，仅将 `PVC_NAME` 换为 `manual-pvc-normal-1`）
 
-直接复制运行以下脚本（`storage-node-daemon` 会自动在普通 Filestore 的 `/vol1` 下为该员工创建独立子目录 `/vol1/emp-${EMP_ID}` 并挂载进沙箱的 `/workspace/user_data`）：
+直接复制运行以下脚本（自动从 `manual-pvc-normal-1` 对应的 `PV` 提取 Filestore IP 与共享路径，挂载到沙箱容器内的 `/workspace/user_data`，并由 `wrapper.mjs` 自动与 `/home/node/.openclaw` 内存热盘同步）：
 
 ```bash
-EMP_ID="18652181"
-SB_NAME=$(kubectl get sandboxclaim "claim-${EMP_ID}" -o jsonpath='{.status.sandbox.Name}{.status.sandbox.name}')
-if kubectl get pod "$SB_NAME" >/dev/null 2>&1; then
-  POD_NAME="$SB_NAME"
-else
-  POD_NAME=$(kubectl get pod -l "agents.x-k8s.io/sandbox-name=${SB_NAME}" -o jsonpath='{.items[0].metadata.name}')
-fi
+# 1. 填入认领出来的 Pod 名，以及刚创建的普通 Filestore PVC 名
+POD_NAME="dual-emptydir-hot-sqlite-pool-xxxxx"
 PVC_NAME="manual-pvc-normal-1"
 NS="default"
 
-# 1. 自动获取 Pod UID、所在节点 Daemon Pod，以及 PVC 对应的 NFS IP 和根共享路径
+# 2. 自动获取 Pod UID、所在节点 Daemon Pod，以及 PVC 对应的 NFS IP 和路径
 POD_UID=$(kubectl get pod "$POD_NAME" -n "$NS" -o jsonpath='{.metadata.uid}')
 NODE_NAME=$(kubectl get pod "$POD_NAME" -n "$NS" -o jsonpath='{.spec.nodeName}')
 DAEMON_POD=$(kubectl get pod -n "$NS" -l app=storage-node-daemon --field-selector "spec.nodeName=${NODE_NAME}" -o jsonpath='{.items[0].metadata.name}')
 
 PV_NAME=$(kubectl get pvc "$PVC_NAME" -n "$NS" -o jsonpath='{.spec.volumeName}')
 NFS_IP=$(kubectl get pv "$PV_NAME" -o jsonpath='{.spec.csi.volumeAttributes.ip}')
-NFS_ROOT="/$(kubectl get pv "$PV_NAME" -o jsonpath='{.spec.csi.volumeAttributes.volume}')"
-# 按员工工号划分独立子目录切片（若想直接挂根目录，改成 NFS_SHARE="${NFS_ROOT}" 即可）
-NFS_SHARE="${NFS_ROOT}/emp-${EMP_ID}"
+NFS_SHARE="/$(kubectl get pv "$PV_NAME" -o jsonpath='{.spec.csi.volumeAttributes.volume}')"
 
-echo "Binding ${NFS_IP}:${NFS_SHARE} -> Pod ${POD_NAME} (${POD_UID}) via ${DAEMON_POD}..."
+echo "Binding ${NFS_IP}:${NFS_SHARE} -> Pod ${POD_NAME} (${POD_UID}) at /workspace/user_data via ${DAEMON_POD}..."
 
-# 2. 调用 storage-node-daemon 完成子目录自动初始化与 0.2s 晚绑定
+# 3. 调用当前节点 storage-node-daemon 执行 0.2s 晚绑定（带 force_rebind: true 自动接管旧租约）
 kubectl exec -i -n "$NS" "$DAEMON_POD" -c daemon -- python3 - <<EOF
 import json, urllib.request
 req = urllib.request.Request(
@@ -147,10 +143,8 @@ req = urllib.request.Request(
 print(urllib.request.urlopen(req, timeout=25).read().decode())
 EOF
 
-# 3. 给 Pod 打上员工与 PVC 标签，方便通过 kubectl get pods -l employee-id=... 查询
-kubectl label pod "$POD_NAME" -n "$NS" \
-  employee-id="emp-${EMP_ID}" \
-  latebind-pvc="${PVC_NAME}" --overwrite
+# 4. 给 Pod 打上 PVC 标签，方便通过 kubectl get pods -L latebind-pvc 查询
+kubectl label pod "$POD_NAME" -n "$NS" latebind-pvc="${PVC_NAME}" --overwrite
 ```
 
 #### 3.3 验证 OpenClaw（龙虾）启动与双层存储状态
