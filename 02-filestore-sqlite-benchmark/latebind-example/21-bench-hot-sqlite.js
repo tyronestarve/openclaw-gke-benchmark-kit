@@ -186,23 +186,35 @@ function runSqliteBenchmark(label, fileTag, pragmaSql) {
   console.log('');
 }
 
+function detectLiveDbJournalMode(dir) {
+  const liveDb = path.join(dir, 'openclaw.sqlite');
+  if (!fs.existsSync(liveDb)) return null;
+  let db;
+  try {
+    db = new DatabaseSync(liveDb, { readOnly: true });
+    return db.prepare('PRAGMA journal_mode;').get()?.journal_mode || null;
+  } catch (_) {
+    return null;
+  } finally {
+    try { db?.close(); } catch (_) {}
+  }
+}
+
 const mnt = detectMountType(baseDir);
+const liveJournal = detectLiveDbJournalMode(baseDir);
 console.log('==============================================================');
-console.log('OpenClaw Hot-Tier (emptyDir tmpfs) SQLite Benchmark');
+console.log('OpenClaw 2026.9.1 Hot-Tier (emptyDir tmpfs) SQLite Benchmark');
 console.log(`Target Dir  : ${baseDir} (resolved: ${mnt.resolved})`);
 console.log(`Mount Check : fsType=${mnt.fsType} on mountPoint=${mnt.mountPoint}`);
+if (liveJournal) {
+  console.log(`Live DB     : ${path.join(baseDir, 'openclaw.sqlite')} (journal_mode=${liveJournal})`);
+}
 console.log(`Node.js     : ${process.version}`);
 console.log('==============================================================\n');
 
 try {
   runSqliteBenchmark(
-    '1. Baseline (SQLite Default: DELETE + FULL)',
-    'default',
-    'PRAGMA journal_mode=DELETE; PRAGMA locking_mode=NORMAL; PRAGMA synchronous=FULL;'
-  );
-
-  runSqliteBenchmark(
-    '2. OpenClaw Hot-Tier Active Mode (WAL + NORMAL on emptyDir)',
+    'OpenClaw 2026.9.1 Native Mode on emptyDir (WAL + NORMAL)',
     'wal-normal',
     'PRAGMA journal_mode=WAL; PRAGMA locking_mode=NORMAL; PRAGMA synchronous=NORMAL; PRAGMA busy_timeout=5000;'
   );
