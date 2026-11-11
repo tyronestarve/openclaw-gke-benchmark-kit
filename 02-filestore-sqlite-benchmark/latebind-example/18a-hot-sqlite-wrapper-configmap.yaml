@@ -1,0 +1,401 @@
+# ==============================================================================
+# 18-dual-emptydir-hot-sqlite-warmpool.yaml
+# GKE Agent Sandbox (gVisor) + SandboxWarmPool + Dual emptyDir 分层存储清单
+#
+# 架构设计：
+#   1. 卷 1 (workspace-volume)：带 force-shared="true" 注解的 emptyDir，挂载于 /workspace，
+#      用于接收 storage-node-daemon 动态晚绑定的 Filestore VolumePool (/workspace/user_data)。
+#   2. 卷 2 (sqlite-hot-dir)：不带注解的默认 emptyDir，直接挂载于 /home/node/.openclaw，
+#      由 gVisor 识别为沙箱内原生 tmpfs 内存盘。业务原有目录结构与 OPENCLAW_STATE_DIR 保持不变，
+#      SQLite 自动进入原生 WAL 模式。
+#   3. 启动包装器 (wrapper.mjs，通过 ConfigMap 挂载，无需重新构建镜像)：
+#      - 预热态等待 /workspace/.ready 信号；
+#      - 认领后将 SQLite 与轻量配置文件从 Filestore 恢复至 /home/node/.openclaw 内存盘；
+#      - 将 workspace、workspace-<agentId>、agents/<id>/sessions（及 agents/<id>/ 下除 agent/ 外的子目录）、
+#        browser、media 等大文件与会话归档目录，通过同名软链接 (symlink) 指向 /workspace/user_data
+#        对应目录，直接读写 Filestore，不占用内存（logs 与 workspace-attestations 保留为内存盘实体目录以通过 FsSafe 检查）；
+#      - 运行期按变更将 SQLite 通过 node:sqlite backup() 原子备份回 Filestore，SIGTERM 退出时最终刷回。
+#
+# 前置条件：已部署 17-latebind-agent-volumes.yaml（storage-node-daemon），认领时将员工的
+# Filestore 卷（即原 /home/node/.openclaw 的内容）绑定到 /workspace/user_data。
+# ==============================================================================
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: hot-sqlite-wrapper
+  namespace: default
+data:
+  wrapper.mjs: |
+    import fs from "node:fs";
+    import path from "node:path";
+    import os from "node:os";
+    import { spawn } from "node:child_process";
+    import { randomBytes } from "node:crypto";
+    import sqlite from "node:sqlite";
+
+    const MOUNT_ROOT      = process.env.MOUNT_PATH || "/workspace";
+    const READY_FILE      = path.join(MOUNT_ROOT, ".ready");
+    const NFS_MOUNT_DIR   = path.join(MOUNT_ROOT, "user_data");
+    const HOT_DIR         = process.env.OPENCLAW_STATE_DIR || "/home/node/.openclaw";
+    const POD_UID         = process.env.POD_UID || "unknown-pod-uid";
+    const META_FILE       = path.join(HOT_DIR, ".hot-meta.json");
+    const DEBOUNCE_MS     = Number(process.env.SYNC_DEBOUNCE_MS || 500);
+    const MAX_INTERVAL_MS = Number(process.env.SYNC_MAX_INTERVAL_MS || 5000);
+    const HOT_LIMIT_MB    = Number(process.env.HOT_LIMIT_MB || 1024);
+    const APP_CMD         = process.env.APP_CMD || "node openclaw.mjs gateway --bind lan --port 18789";
+
+    const log = (msg, extra = {}) =>
+      console.log(JSON.stringify({ ts: new Date().toISOString(), component: "hot-sqlite-wrapper", podUid: POD_UID, msg, ...extra }));
+
+    const isSkippedFile = (name) =>
+      name.endsWith("-wal") ||
+      name.endsWith("-shm") ||
+      name.endsWith("-journal") ||
+      name.endsWith(".log") ||
+      name === ".hot-meta.json" ||
+      name.includes(".tmp.") ||
+      /\.tmp-|\.backup-|\.legacy-bak$|\.migrated($|\.)|\.bak($|\.)/.test(name);
+
+    const EPHEMERAL_TOP_DIRS = new Set(["tmp", "cache"]);
+    // OpenClaw 2026.9.1 FsSafe 禁止 stateDir 下的 workspace-attestations 与 logs 通过软链跳出 ~/.openclaw
+    const HOT_STATE_TOP_DIRS = new Set(["workspace-attestations", "workspace-state", "logs"]);
+    const FIXED_COLD_TOP_DIRS = ["workspace", "browser", "media", "delivery-queue-media", ".local", ".openclaw"];
+
+    const isColdTopDir = (name) =>
+      !HOT_STATE_TOP_DIRS.has(name) &&
+      (FIXED_COLD_TOP_DIRS.includes(name) || name.startsWith("workspace-") || name.startsWith("backup"));
+
+    function isColdRelPath(rel) {
+      const parts = rel.split(path.sep);
+      if (parts.length === 0) return false;
+      if (EPHEMERAL_TOP_DIRS.has(parts[0]) || parts[0] === ".auth-secrets") return true;
+      if (isColdTopDir(parts[0])) return true;
+      if (parts[0] === "agents" && parts.length >= 3 && parts[2] !== "agent") return true;
+      return false;
+    }
+
+    function isSqliteFile(filePath) {
+      try {
+        const fd = fs.openSync(filePath, "r");
+        const buf = Buffer.alloc(16);
+        fs.readSync(fd, buf, 0, 16, 0);
+        fs.closeSync(fd);
+        return buf.toString("latin1", 0, 15) === "SQLite format 3";
+      } catch {
+        return false;
+      }
+    }
+
+    function walkHotFiles(base, rel = "", out = []) {
+      const cur = path.join(base, rel);
+      if (!fs.existsSync(cur)) return out;
+      for (const ent of fs.readdirSync(cur, { withFileTypes: true })) {
+        const subRel = rel ? path.join(rel, ent.name) : ent.name;
+        if (ent.isSymbolicLink() || isColdRelPath(subRel)) continue;
+        if (ent.isDirectory()) walkHotFiles(base, subRel, out);
+        else if (ent.isFile() && !isSkippedFile(ent.name)) out.push(subRel);
+      }
+      return out;
+    }
+
+    async function atomicWrite(dstFinal, produce) {
+      const tmp = `${dstFinal}.tmp.${process.pid}`;
+      fs.mkdirSync(path.dirname(dstFinal), { recursive: true });
+      await produce(tmp);
+      const fd = fs.openSync(tmp, "r+");
+      fs.fsyncSync(fd);
+      fs.closeSync(fd);
+      fs.renameSync(tmp, dstFinal);
+    }
+
+    function ensureSymlinkToNfs(coldRoot, rel) {
+      const hotPath  = path.join(HOT_DIR, rel);
+      const coldPath = path.join(coldRoot, rel);
+      fs.mkdirSync(coldPath, { recursive: true });
+      try {
+        const st = fs.lstatSync(hotPath);
+        if (st.isSymbolicLink()) return;
+        if (st.isDirectory()) fs.cpSync(hotPath, coldPath, { recursive: true, force: false, errorOnExist: false });
+        fs.rmSync(hotPath, { recursive: true, force: true });
+      } catch {}
+      fs.mkdirSync(path.dirname(hotPath), { recursive: true });
+      fs.symlinkSync(coldPath, hotPath);
+    }
+
+    // 运行期新建、尚未软链的冷目录（例如新 Agent 的 workspace-<id> / sessions）在退出前拷回 Filestore
+    function flushNewColdDirs(coldRoot) {
+      const copyIfReal = (rel) => {
+        const hotPath = path.join(HOT_DIR, rel);
+        try {
+          const st = fs.lstatSync(hotPath);
+          if (st.isDirectory() && !st.isSymbolicLink()) {
+            fs.cpSync(hotPath, path.join(coldRoot, rel), { recursive: true, force: true });
+            log("Flushed runtime-created cold directory to Filestore", { rel });
+          }
+        } catch {}
+      };
+      try {
+        for (const ent of fs.readdirSync(HOT_DIR, { withFileTypes: true })) {
+          if (ent.isDirectory() && isColdTopDir(ent.name)) copyIfReal(ent.name);
+        }
+        for (const id of fs.readdirSync(path.join(HOT_DIR, "agents"))) {
+          for (const sub of fs.readdirSync(path.join(HOT_DIR, "agents", id), { withFileTypes: true })) {
+            if (sub.name !== "agent") copyIfReal(path.join("agents", id, sub.name));
+          }
+        }
+      } catch {}
+    }
+
+    function configuredAgentIds(cfgFile) {
+      try {
+        const cfg = JSON.parse(fs.readFileSync(cfgFile, "utf8"));
+        const ids = [];
+        if (Array.isArray(cfg?.agents?.list)) for (const a of cfg.agents.list) if (a?.id) ids.push(String(a.id));
+        if (cfg?.agents?.entries && typeof cfg.agents.entries === "object") ids.push(...Object.keys(cfg.agents.entries));
+        return ids;
+      } catch {
+        return [];
+      }
+    }
+
+    log("Waiting for late-bind .ready signal...", { READY_FILE });
+    while (!fs.existsSync(READY_FILE)) await new Promise((r) => setTimeout(r, 100));
+
+    // 等待 Filestore 挂载可写。容器原地重启（崩溃 / OOM）后，晚绑定挂载需要控制面重新调用 bind_nfs，
+    // 在此之前保持等待（不退出），重新绑定后即可把内存盘中尚未同步的数据刷回 Filestore。
+    for (let waited = 0; ; waited += 500) {
+      try { fs.accessSync(NFS_MOUNT_DIR, fs.constants.W_OK); break; } catch {}
+      if (waited % 10000 === 0) log("Waiting for Filestore mount to become writable (re-run bind_nfs if the container restarted)", { NFS_MOUNT_DIR });
+      await new Promise((r) => setTimeout(r, 500));
+    }
+
+    // 兼容两种卷内布局：卷根即原 ~/.openclaw 内容；或卷内有一层 .openclaw 子目录
+    const COLD_ROOT = process.env.NFS_OPENCLAW_DIR || (
+      fs.existsSync(path.join(NFS_MOUNT_DIR, "openclaw.json")) ||
+      fs.existsSync(path.join(NFS_MOUNT_DIR, "agents")) ||
+      fs.existsSync(path.join(NFS_MOUNT_DIR, "state"))
+        ? NFS_MOUNT_DIR
+        : path.join(NFS_MOUNT_DIR, ".openclaw")
+    );
+    fs.mkdirSync(COLD_ROOT, { recursive: true });
+    fs.mkdirSync(HOT_DIR, { recursive: true });
+
+    // OAuth 本地加密密钥目录 (~/.config/openclaw) 持久化到 Filestore
+    const authSecretDir = path.join(COLD_ROOT, ".auth-secrets");
+    const cfgSecretLink = path.join(os.homedir(), ".config", "openclaw");
+    fs.mkdirSync(authSecretDir, { recursive: true });
+    fs.mkdirSync(path.dirname(cfgSecretLink), { recursive: true });
+    try {
+      const st = fs.lstatSync(cfgSecretLink);
+      if (!st.isSymbolicLink() && st.isDirectory()) fs.cpSync(cfgSecretLink, authSecretDir, { recursive: true, force: false, errorOnExist: false });
+      fs.rmSync(cfgSecretLink, { recursive: true, force: true });
+    } catch {}
+    fs.symlinkSync(authSecretDir, cfgSecretLink);
+
+    const synced = new Map();
+    const managedFiles = new Set();
+    let syncing = false, dirty = false, lastSyncAt = 0, timer = null;
+
+    async function syncAll(force = false) {
+      if (syncing) { dirty = true; return; }
+      syncing = true;
+      try {
+        const t0 = performance.now();
+        let count = 0;
+        const hotFiles = walkHotFiles(HOT_DIR);
+        for (const rel of hotFiles) {
+          const src = path.join(HOT_DIR, rel);
+          const dst = path.join(COLD_ROOT, rel);
+          const st = fs.statSync(src);
+          let sig = `${st.mtimeMs}:${st.size}`;
+          const walPath = `${src}-wal`;
+          if (fs.existsSync(walPath)) {
+            const wst = fs.statSync(walPath);
+            sig += `:${wst.mtimeMs}:${wst.size}`;
+          }
+          if (!force && synced.get(rel) === sig) continue;
+          if (isSqliteFile(src)) {
+            const db = new sqlite.DatabaseSync(src, { readOnly: true });
+            try {
+              await atomicWrite(dst, async (tmp) => {
+                if (fs.existsSync(tmp)) fs.unlinkSync(tmp);
+                await sqlite.backup(db, tmp);
+              });
+            } finally {
+              db.close();
+            }
+          } else {
+            await atomicWrite(dst, (tmp) => {
+              fs.copyFileSync(src, tmp);
+              fs.chmodSync(tmp, st.mode & 0o777);
+            });
+          }
+          synced.set(rel, sig);
+          managedFiles.add(rel);
+          count++;
+        }
+        // 只删除本实例管理过、且已被业务删除的热文件；冷目录永不触碰
+        const hotSet = new Set(hotFiles);
+        for (const rel of [...managedFiles]) {
+          if (!hotSet.has(rel)) {
+            fs.rmSync(path.join(COLD_ROOT, rel), { force: true });
+            synced.delete(rel);
+            managedFiles.delete(rel);
+          }
+        }
+        lastSyncAt = Date.now();
+        if (count > 0) log("Synced hot state to Filestore", { files: count, elapsedMs: +(performance.now() - t0).toFixed(1), force });
+      } catch (err) {
+        log("Sync warning", { error: String(err) });
+      } finally {
+        syncing = false;
+        if (dirty) { dirty = false; schedule(); }
+      }
+    }
+
+    function schedule() {
+      clearTimeout(timer);
+      const overdue = Date.now() - lastSyncAt > MAX_INTERVAL_MS;
+      timer = setTimeout(() => void syncAll(false), overdue ? 0 : DEBOUNCE_MS);
+    }
+
+    let meta = null;
+    try { meta = JSON.parse(fs.readFileSync(META_FILE, "utf8")); } catch {}
+    if (meta && meta.pod_uid === POD_UID) {
+      // 同一 Pod 内容器重启：内存盘数据比 Filestore 新，先刷回，绝不反向覆盖
+      log("In-place container restart detected; flushing hot state before start", { restarts: (meta.restarts || 0) + 1 });
+      flushNewColdDirs(COLD_ROOT);
+      await syncAll(true);
+      meta.restarts = (meta.restarts || 0) + 1;
+    } else {
+      const t0 = performance.now();
+      let count = 0;
+      for (const rel of walkHotFiles(COLD_ROOT)) {
+        const src = path.join(COLD_ROOT, rel);
+        const dst = path.join(HOT_DIR, rel);
+        fs.mkdirSync(path.dirname(dst), { recursive: true });
+        fs.copyFileSync(src, dst);
+        fs.chmodSync(dst, fs.statSync(src).mode & 0o777);
+        managedFiles.add(rel);
+        count++;
+      }
+      log("Restored hot state from Filestore", { coldRoot: COLD_ROOT, files: count, elapsedMs: +(performance.now() - t0).toFixed(1) });
+      meta = { pod_uid: POD_UID, restored_at: new Date().toISOString(), restarts: 0 };
+    }
+    fs.writeFileSync(META_FILE, JSON.stringify(meta));
+
+    // 新员工首次绑定空白子目录时，若尚无 openclaw.json 则自动初始化最小配置，防止 gateway 因缺配置退出。
+    // 注意：`gateway --bind lan` 在无 auth 时会以 exit 78 拒绝启动（"Refusing to bind gateway to lan without auth"），
+    // 容器随之重启、runsc-gofer 重建、晚绑定挂载丢失。因此这里必须同时生成 gateway.auth.token。
+    const hotCfg = path.join(HOT_DIR, "openclaw.json");
+    if (!fs.existsSync(hotCfg)) {
+      const token = process.env.OPENCLAW_GATEWAY_TOKEN || randomBytes(24).toString("hex");
+      fs.writeFileSync(hotCfg, JSON.stringify({ gateway: { mode: "local", auth: { mode: "token", token } } }, null, 2), { mode: 0o600 });
+      log("Initialized default openclaw.json (gateway.mode=local + auth.token) for new empty workspace", { hotCfg, tokenSource: process.env.OPENCLAW_GATEWAY_TOKEN ? "env" : "generated" });
+    }
+
+    // 顶层冷目录软链：固定列表 + Filestore 上已有的 workspace-* / backup*
+    const coldTopSet = new Set(FIXED_COLD_TOP_DIRS);
+    for (const ent of fs.readdirSync(COLD_ROOT, { withFileTypes: true })) {
+      if (ent.isDirectory() && isColdTopDir(ent.name)) coldTopSet.add(ent.name);
+    }
+
+    // Agent 集合：Filestore / 内存盘上已有的 agents/<id> + openclaw.json 中声明的 Agent
+    // 默认 Agent 的 id 为 main；新员工的空卷上也会预先建立它的软链
+    const agentIds = new Set(["main", ...configuredAgentIds(path.join(HOT_DIR, "openclaw.json"))]);
+    for (const base of [path.join(COLD_ROOT, "agents"), path.join(HOT_DIR, "agents")]) {
+      try {
+        for (const ent of fs.readdirSync(base, { withFileTypes: true })) if (ent.isDirectory()) agentIds.add(ent.name);
+      } catch {}
+    }
+    // 预建每个 Agent 的工作区软链（未配置 agents.defaults.workspace 时，非默认 Agent 工作区为 workspace-<id>）
+    for (const id of agentIds) coldTopSet.add(`workspace-${id}`);
+    for (const dirName of coldTopSet) ensureSymlinkToNfs(COLD_ROOT, dirName);
+
+    for (const id of agentIds) {
+      ensureSymlinkToNfs(COLD_ROOT, path.join("agents", id, "sessions"));
+      try {
+        for (const sub of fs.readdirSync(path.join(COLD_ROOT, "agents", id), { withFileTypes: true })) {
+          if (sub.isDirectory() && sub.name !== "agent") ensureSymlinkToNfs(COLD_ROOT, path.join("agents", id, sub.name));
+        }
+      } catch {}
+    }
+
+    const hotBytes = walkHotFiles(HOT_DIR).reduce((sum, rel) => sum + fs.statSync(path.join(HOT_DIR, rel)).size, 0);
+    log("Hot tmpfs directory usage", { usedMb: +(hotBytes / 1048576).toFixed(1), limitMb: HOT_LIMIT_MB });
+    if (hotBytes > HOT_LIMIT_MB * 1048576 * 0.8) {
+      log("ERROR: Hot state exceeds 80% of tmpfs sizeLimit; refusing to start to prevent OOM");
+      process.exit(78);
+    }
+
+    // gVisor 的 tmpfs emptyDir 挂载根 (/home/node/.openclaw) 属主为 root:root (01777)；
+    // 原版 OpenClaw doctor --fix 在更新配置时会对 stateDir 根目录调 fchmod(0o700) 触发 EPERM，注入轻量容错 shim 兼容原版与定制镜像
+    const shimPath = "/tmp/openclaw-tmpfs-root-shim.mjs";
+    fs.writeFileSync(
+      shimPath,
+      [
+        'import fs from "node:fs";',
+        `const ROOT = ${JSON.stringify(path.resolve(HOT_DIR))};`,
+        "const origOpen = fs.promises.open;",
+        "fs.promises.open = async function (...args) {",
+        "  const fh = await origOpen.apply(this, args);",
+        "  if (typeof args[0] === 'string' && args[0].replace(/\\/+$/, '') === ROOT) {",
+        "    const origChmod = fh.chmod.bind(fh);",
+        "    fh.chmod = async (m) => { try { return await origChmod(m); } catch (e) { if (e && e.code === 'EPERM') return; throw e; } };",
+        "  }",
+        "  return fh;",
+        "};",
+        "const origChmodP = fs.promises.chmod;",
+        "fs.promises.chmod = async function (p, m) {",
+        "  try { return await origChmodP.call(this, p, m); } catch (e) { if (e && e.code === 'EPERM' && String(p).replace(/\\/+$/, '') === ROOT) return; throw e; }",
+        "};",
+      ].join("\n"),
+      { mode: 0o644 }
+    );
+    const childEnv = {
+      ...process.env,
+      NODE_OPTIONS: `${process.env.NODE_OPTIONS || ""} --import file://${shimPath}`.trim(),
+    };
+
+    const workdir = fs.existsSync("/app") ? "/app" : process.cwd();
+    const shellCmd = /[;&|]/.test(APP_CMD) ? APP_CMD : `exec ${APP_CMD}`;
+    const child = spawn("/bin/sh", ["-c", shellCmd], { cwd: workdir, stdio: "inherit", env: childEnv });
+    log("Started main process", { cmd: APP_CMD, pid: child.pid });
+
+    try {
+      fs.watch(HOT_DIR, { recursive: true }, (_event, filename) => {
+        if (!filename || !isSkippedFile(path.basename(filename))) schedule();
+      });
+    } catch (err) {
+      log("fs.watch unavailable, falling back to interval sync", { error: String(err) });
+    }
+    const tick = setInterval(() => schedule(), MAX_INTERVAL_MS);
+
+    let stopping = false;
+    async function gracefulShutdown(sig) {
+      if (stopping) return;
+      stopping = true;
+      clearInterval(tick);
+      clearTimeout(timer);
+      log(`Received ${sig}; stopping main process and flushing final state...`);
+      child.kill("SIGTERM");
+      await new Promise((resolve) => { child.once("exit", resolve); setTimeout(resolve, 20000); });
+      while (syncing) await new Promise((r) => setTimeout(r, 50));
+      flushNewColdDirs(COLD_ROOT);
+      await syncAll(true);
+      log("Final flush completed cleanly; exiting 0");
+      process.exit(0);
+    }
+
+    process.on("SIGTERM", () => void gracefulShutdown("SIGTERM"));
+    process.on("SIGINT",  () => void gracefulShutdown("SIGINT"));
+
+    child.on("exit", async (code) => {
+      if (stopping) return;
+      clearInterval(tick);
+      clearTimeout(timer);
+      while (syncing) await new Promise((r) => setTimeout(r, 50));
+      flushNewColdDirs(COLD_ROOT);
+      await syncAll(true);
+      process.exit(code ?? 1);
+    });
