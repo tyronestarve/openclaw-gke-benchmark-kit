@@ -11,9 +11,9 @@
 #   3. 启动包装器 (wrapper.mjs，通过 ConfigMap 挂载，无需重新构建镜像)：
 #      - 预热态等待 /workspace/.ready 信号；
 #      - 认领后将 SQLite 与轻量配置文件从 Filestore 恢复至 /home/node/.openclaw 内存盘；
-#      - 将 workspace、workspace-*、agents/<id>/sessions（及 agents/<id>/ 下除 agent/ 外的子目录）、
-#        browser、media、logs 等大文件与日志目录，通过同名软链接 (symlink) 指向 /workspace/user_data
-#        对应目录，直接读写 Filestore，不占用内存；
+#      - 将 workspace、workspace-<agentId>、agents/<id>/sessions（及 agents/<id>/ 下除 agent/ 外的子目录）、
+#        browser、media 等大文件与会话归档目录，通过同名软链接 (symlink) 指向 /workspace/user_data
+#        对应目录，直接读写 Filestore，不占用内存（logs 与 workspace-attestations 保留为内存盘实体目录以通过 FsSafe 检查）；
 #      - 运行期按变更将 SQLite 通过 node:sqlite backup() 原子备份回 Filestore，SIGTERM 退出时最终刷回。
 #
 # 前置条件：已部署 17-latebind-agent-volumes.yaml（storage-node-daemon），认领时将员工的
@@ -51,15 +51,19 @@ data:
       name.endsWith("-wal") ||
       name.endsWith("-shm") ||
       name.endsWith("-journal") ||
+      name.endsWith(".log") ||
       name === ".hot-meta.json" ||
       name.includes(".tmp.") ||
-      /\.tmp-|\.backup-|\.legacy-bak$|\.migrated$/.test(name);
+      /\.tmp-|\.backup-|\.legacy-bak$|\.migrated($|\.)|\.bak($|\.)/.test(name);
 
     const EPHEMERAL_TOP_DIRS = new Set(["tmp", "cache"]);
-    const FIXED_COLD_TOP_DIRS = ["workspace", "browser", "media", "delivery-queue-media", "logs", ".local", ".openclaw"];
+    // OpenClaw 2026.9.1 FsSafe 禁止 stateDir 下的 workspace-attestations 与 logs 通过软链跳出 ~/.openclaw
+    const HOT_STATE_TOP_DIRS = new Set(["workspace-attestations", "workspace-state", "logs"]);
+    const FIXED_COLD_TOP_DIRS = ["workspace", "browser", "media", "delivery-queue-media", ".local", ".openclaw"];
 
     const isColdTopDir = (name) =>
-      FIXED_COLD_TOP_DIRS.includes(name) || name.startsWith("workspace-") || name.startsWith("backup");
+      !HOT_STATE_TOP_DIRS.has(name) &&
+      (FIXED_COLD_TOP_DIRS.includes(name) || name.startsWith("workspace-") || name.startsWith("backup"));
 
     function isColdRelPath(rel) {
       const parts = rel.split(path.sep);
@@ -324,8 +328,38 @@ data:
       process.exit(78);
     }
 
+    // gVisor 的 tmpfs emptyDir 挂载根 (/home/node/.openclaw) 属主为 root:root (01777)；
+    // 原版 OpenClaw doctor --fix 在更新配置时会对 stateDir 根目录调 fchmod(0o700) 触发 EPERM，注入轻量容错 shim 兼容原版与定制镜像
+    const shimPath = "/tmp/openclaw-tmpfs-root-shim.mjs";
+    fs.writeFileSync(
+      shimPath,
+      [
+        'import fs from "node:fs";',
+        `const ROOT = ${JSON.stringify(path.resolve(HOT_DIR))};`,
+        "const origOpen = fs.promises.open;",
+        "fs.promises.open = async function (...args) {",
+        "  const fh = await origOpen.apply(this, args);",
+        "  if (typeof args[0] === 'string' && args[0].replace(/\\/+$/, '') === ROOT) {",
+        "    const origChmod = fh.chmod.bind(fh);",
+        "    fh.chmod = async (m) => { try { return await origChmod(m); } catch (e) { if (e && e.code === 'EPERM') return; throw e; } };",
+        "  }",
+        "  return fh;",
+        "};",
+        "const origChmodP = fs.promises.chmod;",
+        "fs.promises.chmod = async function (p, m) {",
+        "  try { return await origChmodP.call(this, p, m); } catch (e) { if (e && e.code === 'EPERM' && String(p).replace(/\\/+$/, '') === ROOT) return; throw e; }",
+        "};",
+      ].join("\n"),
+      { mode: 0o644 }
+    );
+    const childEnv = {
+      ...process.env,
+      NODE_OPTIONS: `${process.env.NODE_OPTIONS || ""} --import file://${shimPath}`.trim(),
+    };
+
     const workdir = fs.existsSync("/app") ? "/app" : process.cwd();
-    const child = spawn("/bin/sh", ["-c", `exec ${APP_CMD}`], { cwd: workdir, stdio: "inherit", env: process.env });
+    const shellCmd = /[;&|]/.test(APP_CMD) ? APP_CMD : `exec ${APP_CMD}`;
+    const child = spawn("/bin/sh", ["-c", shellCmd], { cwd: workdir, stdio: "inherit", env: childEnv });
     log("Started main process", { cmd: APP_CMD, pid: child.pid });
 
     try {

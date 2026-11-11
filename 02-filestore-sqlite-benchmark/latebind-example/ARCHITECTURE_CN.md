@@ -49,11 +49,11 @@
 
 | 业务访问路径（保持不变） | 容器内形态 | 物理位置 |
 | :--- | :--- | :--- |
-| `state/openclaw.sqlite`、`agents/<id>/agent/*.sqlite`、`memory/`、`flows/`、`tasks/` 等 SQLite 与 `openclaw.json` 等轻量文件 | 实体文件 | **内存盘 `tmpfs`（原生 WAL）**，变更后原子备份回 Filestore |
+| `state/openclaw.sqlite`、`agents/<id>/agent/*.sqlite`、`memory/`、`flows/`、`tasks/`、`workspace-attestations/`、`logs/`（非 `.log` 审计文件）及 `openclaw.json` 等轻量文件 | 实体文件 | **内存盘 `tmpfs`（原生 WAL，通过 `FsSafe` 安全边界检查）**，变更后原子备份回 Filestore |
 | `workspace`、`workspace-<agentId>` | 软链接 → `/workspace/user_data/...` | **Filestore** |
 | `agents/<id>/sessions`（`*.jsonl` / `*.trajectory.jsonl`）及 `agents/<id>/` 下除 `agent/` 外的其他子目录 | 软链接 → `/workspace/user_data/...` | **Filestore** |
-| `browser`、`media`、`delivery-queue-media`、`logs`、`.local` | 软链接 → `/workspace/user_data/...` | **Filestore** |
-| `*.tmp-*`、`*.backup-*`、`*.legacy-bak`、`*.migrated`（历史升级/崩溃残留） | 不恢复、不同步 | 留在 Filestore 原处 |
+| `browser`、`media`、`delivery-queue-media`、`.local` | 软链接 → `/workspace/user_data/...` | **Filestore** |
+| `*.log`、`*.tmp-*`、`*.backup-*`、`*.legacy-bak`、`*.migrated*`、`*.bak*`（历史升级/崩溃残留与原始日志） | 不恢复、不同步 | 留在 Filestore 原处 |
 
 > [!IMPORTANT]
 > 请**不要**在 `openclaw.json` 中配置 `session.store` 来迁移 sessions：OpenClaw 会依据 `session.store` 推导 Agent SQLite 的路径，导致 SQLite 一并落到 Filestore。sessions 的分流统一由上述软链接完成。

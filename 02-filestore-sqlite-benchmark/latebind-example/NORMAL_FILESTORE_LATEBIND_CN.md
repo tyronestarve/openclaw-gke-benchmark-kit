@@ -13,7 +13,7 @@
   * **普通 Filestore（无需白名单，本指南方案）**：申请 `manual-pvc-normal-1` 时直接创建 1 台独立的 `1Ti` Filestore 实例（在 PV 中的共享名为 `/vol1`），**昨天的晚绑定脚本一行都不用改逻辑**，只需把 `PVC_NAME` 换成 `"manual-pvc-normal-1"` 即可直接挂载验证（若需在一张普通 PVC 上隔离多个员工，也可在 `NFS_SHARE` 后追加子目录）。
 * **容器内 OpenClaw（龙虾）目录与挂载路径对应关系**：
   * **`/home/node/.openclaw`（容器内 OpenClaw 主目录 / `tmpfs` 内存热盘）**：对应 `sqlite-hot-dir`（`emptyDir`），存放 `openclaw.json`、热态 `SQLite/WAL` 数据库及运行态文件。
-  * **`/workspace/user_data`（容器内 Filestore 晚绑定挂载点）**：`storage-node-daemon` 将 Filestore PVC 的共享目录（`/vol1`）直接挂载到容器内的 `/workspace/user_data`。`wrapper.mjs` 会自动在 `/home/node/.openclaw` 与 `/workspace/user_data` 之间同步热状态并建立冷数据软链（`workspace`、`agents/<id>/sessions`、`media`、`logs` 等）。
+  * **`/workspace/user_data`（容器内 Filestore 晚绑定挂载点）**：`storage-node-daemon` 将 Filestore PVC 的共享目录（`/vol1`）直接挂载到容器内的 `/workspace/user_data`。`wrapper.mjs` 会自动在 `/home/node/.openclaw` 与 `/workspace/user_data` 之间同步热状态并建立冷数据软链（`workspace`、`workspace-<id>`、`agents/<id>/sessions`、`media`、`browser` 等）。
 
 ### 2. Filestore 创建后的 IP 在哪里？为什么晚绑定要读 IP，而普通挂载不用？
 * **IP 在哪里**：当 K8s 的 `PVC` 变为 `Bound` 后，Filestore CSI 驱动会自动把分配好的内网 IP 写入对应 `PV`（PersistentVolume）对象的 `.spec.csi.volumeAttributes.ip` 字段中，脚本直接通过 `kubectl get pv` 自动读取，无需人工去控制台查找。
